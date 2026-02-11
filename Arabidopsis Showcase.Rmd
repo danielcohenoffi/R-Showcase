@@ -1,0 +1,220 @@
+---
+title: "Arabidopsis Modeling"
+author: "Daniel Cohen"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+This will be a showcase of count regression, using the Arabidopsis dataset from the package lme4, but using the package glmmTMB for it's added flexibility. The methods showcased here are useful for any case where the outcome of interest is a count of objects or events. No coding or statistical background should be necessary to understand the discussion here, but code is provided.
+
+Arabidopsis is a genus of small cabbage-like flowering plants. One of its members, thale cress, is a common model organism due to its small genome.
+
+In this data, scientists examined 625 plants from the Netherlands, Spain, and Sweden for their total seed set ("total fruits") in the dataset, under different conditions of fertilization and simulated herbivory.
+
+```{r setup, include=FALSE}
+library(lme4)
+library(glmmTMB)
+library(dplyr)
+library(stats)
+library(ggplot2)
+#Arabidopsis$nutrient <- recode(Arabidopsis$nutrient, '1' =  'Minimal Nutrients', "8" =  'Added Nutrients')
+#Arabidopsis$rack <- as.factor(Arabidopsis$rack)
+```
+
+One of the most important parts of modeling this is determining the nesting structure. The plants were from 3 countries, 9 populations, and 24 genotypes. It is important to determine whether each population could be in multiple countries or not for the statistical model.
+
+```{r cars}
+library(ivo.table)
+Arabidopsis |> select(reg, popu) |> ivo_table()
+Arabidopsis |> select(popu, gen) |> ivo_table()
+```
+
+In these tables, since each column only has one nonzero entry, we can determine that each population exists in only one country, and each genotype exists in only one population. We can then examine the frequencies of the treatment conditions:
+
+```{r }
+Arabidopsis |> select(rack, nutrient, amd) |> ivo_table()
+Arabidopsis |> select(reg, nutrient, amd) |> ivo_table()
+Arabidopsis |> select(status, nutrient, amd) |> ivo_table()
+```
+
+On each greenhouse rack, roughly equal numbers of plants were clipped or not to simulate herbivory, and were given added or minimal nutrients. Of the three countries of origin, the number of plants was unequal, but the proportions were mostly balanced among treatments. The same is true for the way the plant was germinated.
+
+```{r}
+ggplot(data = Arabidopsis, aes(x = total.fruits)) + geom_histogram() +labs(title = "Number of Plants with each Number of Fruit",
+       x = "Number of Fruit", 
+       y = "Number of Plants")
+```
+
+The data is quite right skewed. Normal models, those using the familiar bell curve, cannot cope with data that has large numbers of observations at a hard cutoff like this. Fitting such a model would result in many predictions of negative numbers of fruit, which is nonsensical. Other models, however, can handle this data without issue, predicting only zero or positive whole numbers
+
+```{r}
+dopsis_poisson <- glmmTMB(total.fruits ~ rack + nutrient + status + amd +  reg + (1|popu/gen), data = Arabidopsis, family = "poisson")
+
+dopsis_nb1<-  glmmTMB(total.fruits ~ rack + nutrient + status + amd + reg + 
+                 (1|popu/gen),
+             data = Arabidopsis, family = "nbinom1")
+
+dopsis_nb2 <- glmmTMB(total.fruits ~ rack + nutrient + status + amd + reg + 
+                  (1|popu/gen), data = Arabidopsis, family = "nbinom2")
+
+dopsis_genpoisson <- glmmTMB(total.fruits ~ rack + nutrient + status + amd +  reg + (1|popu/gen), data = Arabidopsis, family = "genpois")
+
+dopsis_model_list <- list("Poisson GLMM" = dopsis_poisson, 
+                          "Linear Dispersion NB GLMM" = dopsis_nb1, 
+                          "Quadratic Dispersion GLMM" = dopsis_nb2,
+                          "Generalized Exponential Dispersion Poisson" = dopsis_genpoisson)
+
+library(sjPlot)
+tab_model(dopsis_model_list, show.r2 = TRUE, show.AICC = TRUE,
+          show.loglik = TRUE, title = "Arabidopsis Total Fruits Models", show.est = FALSE, show.p = FALSE,
+          dv.labels = names(dopsis_model_list))
+```
+
+The provided description of the data suggested several factors, the rack of the greenhouse, the country of origin of the plant, and how the plant was germinated, were not of interest and only included as nuisance factors. However, there were only 2 racks and 3 each of countries or types of origin, which makes treating them as nuisance factors mathematically awkward, and so here I treat them as fixed factors of interest, while treating the different populations and genotypes of origin as nuisance factors.
+
+I have suppressed the p values and parameter estimates here because the most important thing here is in fact the choice of distribution, not predictions of fruit set. The most common model type for count data is the Poisson distribution, named after the 18th-19th century French Mathematician, who first described it. However, it assumes a rigid relationship between the average outcome and the spread around the average. The glmmTMB package provides a number of alternative distributions for count data. Here, I have shown the two Negative Binomial (NB) distributions, as well as the Generalized Poisson. These models provide different ways the spread is modeled around the mean.
+
+I have provided the log likelihoods and R-Squareds for each of these models. The R squared is actually a red herring here, as it assumes the total amount of variation to be explained is correctly calculated by the model's built in spread assumptions. But if the model assumes less spread than actually observed, the R-Squared will be overly optimistic, and this is seen in the plain Poisson model being given the highest statistic. The better way to determine the best model here is the Log Likelihood statistic. These are raw negative numbers in this case, so the best model is the one with the value closest to zero (the latter three models have the same number of parameters), in this case the linear dispersion negative binomial fits the data best, and so I select it.
+
+```{r}
+#Setting the model to REML for robust variance estimates
+dopsis_nb1<-  glmmTMB(total.fruits ~ rack + nutrient + status + amd + reg +  (1|popu/gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+library(performance)
+check_predictions(dopsis_nb1)
+
+```
+
+We can assess the model in a number of ways. The most obvious is to compare the model's predicted number of plants with each number of fruits to the observed data. The density of the dots make it somewhat difficult to assess fit, but the fact that the green circles are mostly covering up the blue ones is a positive sign, as most of the predictions are reasonably close on this scale to the observed.
+
+```{r}
+check_zeroinflation(dopsis_nb1)
+check_distribution(dopsis_nb1)
+check_overdispersion(dopsis_nb1)
+check_singularity(dopsis_nb1)
+```
+
+Here, I put the model through a full battery of diagnostic tests. The test for zero inflation tests whether or not a sub-model to predict excess zeroes is needed, and there is no evidence that such a sub-model is needed. The distribution check examines whether the I correctly fit the best distribution, and it suggests a negative binomial model as I have already done. The test for overdispersion measures whether the spread is still too large, and it finds no evidence for this. Finally, the last test examines whether the model encountered any linear algebra errors, and it does not. Since my model has passed all it's test, I can now interpret it.
+
+```{r}
+library(sjPlot)
+tab_model(dopsis_nb1, title = "Arabidopsis Total Fruits Model")
+```
+
+The overall measure of the model can be found at the bottom of the table. Here, the common R-Squared is given two measures, one "marginal", one "conditional." The distinction here is that the marginal R-squared considers only the factors of direct interest. In my model, I treated sub-populations and genotypes as nuisance parameters, and so any variation explained only by those factors is excluded from marginal R-squared, but included in conditional R-squared. So in this dataset, with this model, 63 % of variation in fruit count can be explained by greenhouse rack, nutrient treatment, germination status, clipping treatment, and country of origin. An additional 31% can be explained by subpopulations and genotypes.
+
+Since most of the categories used to predict were binary, most interpretation can be done directly on this table rather than the emmeans library. The parameters of interest are the incidence ratios. The intercept is an statistical artifact and should not be interpreted. For each of the following statements, effects are on average, holding all other factors equal.
+
+Compared to an equivalent plant on the first rack, a plant on the second rack is predicted to have 58% as many fruits. Compared to an equivalent plant getting extra nutrients, a plant getting minimal nutrients is predicted to have 38% as many fruits. Compared to an equivalent plant normally germinated, a Petri dish germinated plant is predicted to have 72% as many fruits, and a transplanted plan to have 80% as many fruits. Compared to an equivalent clipped plant, an unclipped plant is predicted to have 122% as many fruits. Compared to Dutch plants, Swedish and Spanish plants did not have significant different numbers of fruits.
+
+Comparisons between Swedish and Spanish plants, or between transplant and Petri plate plants can be done with the emmeans package.
+
+```{r}
+library(emmeans)
+means <- emmeans(dopsis_nb1, specs = list("reg", "status"))
+pairs(means, type = "response")
+```
+
+It turns out that Spanish and Swedish plants did differ significantly in fruit set, while Petri plate and transplanted plants did not. The output mentions that tests were done on the log scale, but the ratio provided , 2.534, is on the normal scale, and means that compared to an equivalent Swedish plant, a Spanish plant is predicted to have 2.534 times as many fruits. I also could have gotten this number by taking the ratio of the ratios compared to Dutch plants: 1.58/0.62 = 2.534.
+
+I did omit discussion of the interaction between nutrient treatment and clipping treatment earlier for simplicity. Would it be significant?
+
+```{r}
+dopsis_interaction <- glmmTMB(total.fruits ~ rack +  status + nutrient*amd + reg + (1|popu/gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+tab_model(dopsis_interaction, title = "Interaction Model")
+```
+
+```{r}
+interaction_means<- emmeans(dopsis_interaction, ~ amd|nutrient)
+interaction_means
+```
+
+The interaction is just barely significant at α = 0.1, not at 0.05. The inclusion of the interaction term renders the clipping treatment non significant. The interaction is ordinal, meaning that clipped plants still yielded less in both nutrient treatments, and plants with added nutrients still had more fruits in both clipping treatments.
+
+```{r}
+pairs(interaction_means, type = "response")
+```
+
+In light of the interaction, clipped and unclipped plants with high nutrients did not significantly differ in fruit set, while in the low nutrient setting they did. Here, clipped plants with added nutrients yielded 90% as much as their unclipped counterparts. In the low nutrient setting, clipped plants yielded only 70% as much as their unclipped counterparts.
+
+What follows is more technical, but I encourage non statisticians to continue reading if interested.
+
+```{r}
+ranints <- ranef(dopsis_interaction)$cond
+pop_ints <- as.data.frame(ranints[2])
+gen_ints <- as.data.frame(ranints[1])
+names(gen_ints) <- c("Intercept")
+names(pop_ints) <- c("Intercept")
+ggplot(data = pop_ints, aes(x = Intercept)) + geom_histogram()
+ggplot(data = gen_ints, aes(x = Intercept)) + geom_histogram()
+```
+
+As assumption of most mixed models is that random effects are normally distributed, regardless of the distribution of the outcome variable. The distributions of both the intercepts for population and genotype appear roughly normally distributed, but each have one seeming outlier that indicates a lower fruit yield than the rest.
+
+```{r}
+min(ranints$`gen:popu:reg`)
+min(ranints$`popu:reg`)
+
+print("34:7.SW:SW -0.213335212")
+print("3.NL:NL -0.2374589")
+shapiro.test(gen_ints$Intercept)
+shapiro.test(pop_ints$Intercept)
+```
+
+Formal normality tests tend to be unreliable, and it is typical of normal distributions to contain an outlier or two. Considering the small number of clusters, I am not concerned with the slight deviation from normality. But is the full three tier nesting necessary?
+
+```{r}
+confint(dopsis_interaction, method = "Wald")
+```
+
+It would be preferable to get confidence intervals using the profile or uniroot methods, but those are currently unavailable for REML models. These Wald confidence intervals should be taken with a heavy grain of salt for the random effects, but since Wald confidence limits don't have the 0 boundary issue. Therefore, the fact that all three random effect intervals don't cross 0 is one reason to point of evidence in favor of keeping the full nesting.
+
+I can test different random effect structures here:
+
+```{r}
+dopsis_interaction <-  glmmTMB(total.fruits ~ rack + nutrient*amd + status + amd +(1|reg/popu/gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+dopsis_nb1_nopopu<-  glmmTMB(total.fruits ~ rack + nutrient*amd + status + amd +(1|reg/gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+dopsis_nb1_nogen<-  glmmTMB(total.fruits ~ rack + nutrient*amd + status + amd + (1|reg/popu), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+dopsis_nb1_gen_only<-  glmmTMB(total.fruits ~ rack + nutrient*amd + status+ (1|gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+dopsis_nb1_popu_only <- glmmTMB(total.fruits ~ rack + nutrient*amd + status + amd +(1|gen), data = Arabidopsis, family = "nbinom1", REML = TRUE)
+
+
+anova(dopsis_interaction, dopsis_nb1_nopopu, dopsis_nb1_nogen, dopsis_nb1_gen_only, dopsis_nb1_popu_only)
+
+```
+
+The model with the lowest AIC and BIC is the one that drops the lowest group, genotype, from the random effects model. However, the full 3 way model still has the lowest deviance. That said, at a change in -2LL of only 1.8, the likelihood ratio test would reject the additional parameter.
+
+This seems to me to be more of a philosophical question. I personally would keep the genotype effect, as the researchers who conducted the study appeared to believe it was relevant, and it is not causing model instability. Were I more concerned about power, I might be more inclined to drop it. The p value for the interaction is likely slightly lower in the lower BIC model, but I would rather fit the model that used all the information than the model that got the lowest p value.
+
+```{r}
+check_overdispersion(dopsis_interaction)
+check_overdispersion(dopsis_nb2)
+check_overdispersion(dopsis_poisson)
+check_overdispersion(dopsis_genpoisson)
+```
+
+The negative binomial model "1" used for this code uses the mean variance relationship, similar to a quasipoisson but fully parametric:
+
+V=μ(1+ϕ)
+
+The more common negative binomial model "2" in this code uses the mean variance relationship:
+
+V=μ(1+μ/ϕ)=μ+(μ\^2)/ϕ.
+
+The generalized Poisson model mentioned before uses the mean variance relationship:
+
+V=μexp(η)
+
+The estimate of `phi` for the selected model was 38.7, indicating the residual variance was 38.7+1 times that of the equivalent Poisson distribution.
+
+The standard negative binomial, and generalized Poisson models both had variance estimates significantly greater than observed, while the selected quasipoisson model modestly overestimates dispersion. The Poisson model severely underestimates dispersion.
+
+The glmmTMB also features a "compois" family, but it's mean variance relationship is equivalent to the quasipoisson model used here, and I have encountered computation issues trying to use it.

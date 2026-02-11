@@ -1,0 +1,125 @@
+---
+title: "Wine Showcase"
+author: "Daniel Cohen"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+This will be a showcase of logistic regression, predicting whether a bottle wine is red or white using their chemical characteristics. No coding experience or statistical background should be needed to follow most of this discussion, but code is provided for those who know. All of the methods shown below can be extended to any case of prediction where outcomes come in a small number of categories, with two outcomes being the simplest case.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+library(readr)
+library(stats)
+```
+
+```{r}
+# Import data about white and red wines:
+white <- read.csv("https://tinyurl.com/winedata1",
+                  sep = ";")
+red <- read.csv("https://tinyurl.com/winedata2",
+                sep = ";")
+# Add a type variable:
+white$type <- "white"
+red$type <- "red"
+# Merge the datasets:
+wine <- rbind(white, red)
+wine$type <- factor(wine$type)
+
+library(dplyr)
+#Select all numerical variables for math: 
+wine_numeric <- wine |> select(where(is.numeric))
+```
+
+Here is the information gathered for each bottle of wine. Of note is that over three quarters of the data set is white wines.
+
+```{r}
+colnames(wine)
+summary(wine$type)
+```
+
+While it is generally good practice to do descriptive statistics first, creating the model and showing it's output will reveal some interesting emergent characteristics.
+
+```{r}
+wine_regression <- glm(type ~ ., data = wine, family = "binomial")
+summary <- summary(wine_regression)
+R2 <- 1 - summary$deviance/summary$null.deviance
+round(R2, 2)
+```
+
+If you had no information on any given bottle of wine, a reasonable choice here would be to guess that it was white every time, as the majority of the wines were white. This model has a (pseudo) R-Squared of .94, meaning that the model is able to correctly predict when a bottle of wine is red 94% of the time, which is quite accurate for a computer model with no senses.
+
+```{r}
+predictions <- predict(wine_regression, wine, type = "response")
+predictions <- as.data.frame(predictions)
+library(ggplot2)
+ggplot(data = predictions, (aes(x = predictions))) + geom_histogram()
+```
+
+This plot shows the probability that the model assigned each bottle of wine to being white, with .75 meaning having a 75% chance of being white. The model is not hedging it's bets at all, assigning most bottles an almost sure bet of being its color.
+
+```{r}
+library(car)
+anova_table <- (Anova(wine_regression, type = 3, test.statistic = "Wald" ))[2]
+
+anova_table$Percent_Explained <- anova_table$Chisq/sum(anova_table$Chisq) * 100
+
+round(anova_table,2)
+```
+
+It would be reasonable to guess in this case that maybe one of the chemical traits measured is almost a proxy for color. If for example, you knew how well a bottle of wine would stain a white tablecloth, you could predict color very accurately. In the table above, the number under "Percent_Explained" can be thought of as the portion of the correct red guesses explained by each chemical property, after considering all other properties, with the raw numbers under "Chisq". These numbers do not have an intuitive scale. Clearly, no one property is doing the majority of the explaining.
+
+```{r}
+library(ggplot2)
+ggplot(wine, aes(x = total.sulfur.dioxide, fill = type)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "Overlap: Total Sulfur Dioxide by Wine Type",
+       subtitle = "Modest overlap between red and white wines",
+       x = "Total Sulfur Dioxide (mg/dm³)", 
+       y = "Number of Bottles") +
+  theme_minimal()
+
+ggplot(wine, aes(x = density, fill = type)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "Overlap: Density by Wine Type",
+       subtitle = "Modest overlap between red and white wines",
+       x = "Density of Wine", y  = "Number of Bottles") + 
+  theme_minimal()
+```
+
+There are large overlap portions even in the two chemical properties that did the most work in predicting the color. What this means is that it is not any one property that is allowing the model to be so accurate, but the combination of all the measurements.
+
+This should make sense to any wine drinker. Even blindfolded, most of us would be able to decide with very high accuracy the color of the wine based on its taste and aroma. It turns out that this computer model can do the same thing, "tasting" the wine by its chemical measurements.
+
+What follows is more technical, but I encourage any non statisticians to keep reading.
+
+```{r}
+library(sjPlot)
+tab_model(wine_regression, show.dev = TRUE, show.aicc = TRUE)
+```
+
+The model shows how each chemical property influences it's decision making process, in the form of odds ratios. Odds here are the same as in betting: if you have a 4 in 5 chance of winning a bet, then your odds are 4 (to 1) for winning. If I have a 2 in 3 chance of winning a different bet, then my odds are 2 (to 1) for winning. Therefore, your odds are twice as high as mine, or the odds ratio of your bet to mine is 2. The provided numbers under "Odds Ratios" here is the odds ratio increase for a one unit increase in the given chemical.
+
+So for example, if, all other variables equal, on average, if a bottle of wine were to have 1 unit higher citric acid, then the model would assign it an odds 13.7 times higher of being white vs being red. A couple of these appear to have odds ratios of 0, but that is due to rounding and unit quirks. But a very small odds ratio indicates that for instance, if a wine is denser, then the model assigns it very high odds of being red. The intercept being infinite simply indicates that most wines were white. For these odds ratios, a ratio above 1 indicates that an increase of the property indicates higher odds of being white, and a ratio below 1 indicates lower odds of being white. On average, white wines were associated with higher fixed acidity, citric acidity, residual sugar, and total sulfur dioxide, while red wines were associated with higher volatile acidity, chlorides, free sulfur dioxide, density, sulphates, alcohol content, and overall quality.
+
+```{r}
+library(car)
+round(vif(wine_regression),2)
+```
+
+Usually multicollinearity is a concern with regression models with many predictors. The VIF (variance inflation factor) is a measure of how much the precision of the estimate predictor in a model is affected by other predictors, with values greater than 5 being a cause of modest concern and 10 of great concern. It is worth noting that the overall predictive accuracy of models is not affected by VIF, only our ability to make inference as to the contribution of different predictors. Here, the two variables of concern are density and alcohol, with VIF values just above the 10 and 5 cutoffs, respectively. It might be tempting to remove them, but since the sample size is so large that the p values for these two are extremely small regardless of multicollinearity there is no reason to. I was surprised that VIF was not more of a problem in this set, as I expected the three measures of acidity to be more correlated. There are various graphical methods of assessing correlation among the predictors using the ggAlly and corrplot libraries, but the number of variables makes presentation awkward, and showing VIFs alleviates the most pressing concern.
+
+```{r}
+wine_pca <- prcomp(wine_numeric, scale = TRUE)
+summary(wine_pca)
+library(factoextra)
+fviz_eig(wine_pca, addlabels = TRUE)
+#wine_pca$rotation
+```
+
+Similarly, principle component decomposition is possible, using the correlations among the variables to try to find the underlying abstract concepts of the data. However, in this case, in decomposing the 12 numeric variables, it takes 6 to get to 80% of variance explained and 8 to get to 90%, at the cost of losing the initial variables' clear interpretation.
+
+I have omitted the loadings for brevity, but each principle component tended to be composed of portions of all the variables, further reducing the analysis's use.
