@@ -1,0 +1,415 @@
+---
+title: "Norm and RG binom models"
+author: "Daniel Cohen"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+For technical audiences only.
+
+```{r setup}
+## import and modify data
+library(haven)
+library(here)
+library(haven)
+library(dplyr)
+setwd('/Users/danielcohen/Desktop/R_Code')
+finalcoke <- read_sas("finalcoke", NULL)
+finalcoke$MONTH <- as.factor(finalcoke$MONTH)
+finalcoke$PATNO <- as.factor(finalcoke$PATNO)
+finalcoke$TX_COND <- as.character(finalcoke$TX_COND)
+finalcoke$TXNAME <- dplyr::recode(finalcoke$TX_COND, 
+                        "1" = "IDC", 
+                        "2" = "CT",
+                        "3" = "SE",
+                        "4" = "GDC")
+
+
+timetxMeans <- finalcoke |> group_by(TXNAME, MONTH) |>
+    select(DAYSUSED, PATNO, SITE, GENDER, BDI) |> 
+    mutate(mean_days = mean(DAYSUSED, na.rm = TRUE), sd_days = sd(DAYSUSED, na.rm = TRUE), meanbdi = mean(BDI, na.rm = TRUE) )
+
+timetxMeans$logitmeandays <- log((timetxMeans$mean_days + .1)/(30.1-timetxMeans$mean_days))
+
+timetxMeans$logitdays <- log((timetxMeans$DAYSUSED + 1)/(30.1-timetxMeans$DAYSUSED))
+
+
+finalcoke$treated<- ifelse(test = finalcoke$MONTH == 0, yes = 0, no = 1)
+
+finalcoke$postTreatTime <- ifelse(test = finalcoke$MONTH %in% c(0,1), yes = 0, no = as.numeric(finalcoke$MONTH) -1 ) 
+
+finalcoke$timecombined = finalcoke$treated + finalcoke$postTreatTime
+
+finalcoke$logit_days <- log((finalcoke$DAYSUSED +1) / (30 - finalcoke$DAYSUSED + 1))
+finalcoke$log_days<- log(finalcoke$DAYSUSED + 1)
+   
+```
+
+```{r warning = 0}
+library(ggplot2)
+## plot data with LOESS
+ggplot(data = timetxMeans, aes(x = as.numeric(MONTH),
+                               y = logitdays, color = TXNAME)) + 
+    geom_point() + 
+    geom_smooth() + 
+    scale_y_continuous(limits = c(-3.5, 2) )
+
+```
+
+```{r}
+## variance changes over time, no clear differences in treatment. 
+ggplot(data = timetxMeans, aes(x = as.numeric(MONTH),
+                               y = sd_days, color = TXNAME)) +
+    geom_point() 
+```
+
+```{r}
+## There's some difference in variance across sites. It really seems to be Mclean vs not. 
+library(dplyr)
+siteMeans <- finalcoke |> group_by(SITE, MONTH) |>
+    select(DAYSUSED, PATNO, SITE, GENDER) |> 
+    mutate(mean_days = mean(DAYSUSED, na.rm = TRUE), sd_days = sd(DAYSUSED, na.rm = TRUE))
+
+ggplot(siteMeans, aes(x = MONTH, y = sd_days, color = SITE)) + geom_point()
+```
+
+```{r}
+library(nlme)
+# Full G Matrix has matrix error
+norm_logit_fullg <- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdSymm(~ postTreatTime + treated)),
+    #correlation = corAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_fullg, which = "var-cov")
+
+```
+
+```{r}
+# Uncorrelated G matrix converges
+norm_logit_gonly <- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdDiag(~ postTreatTime + treated)),
+    #correlation = corAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_gonly, which = "var-cov")
+## Variance function is the percentage of variance that exists after treatment vs pre treatment
+```
+
+```{r}
+##Try adding in Residual autocorrelation. No matrix error per se, but the intervals on PostTreatTime are absurdly wide, and may as well include 0. 
+norm_logit_rg_full<- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdDiag(~postTreatTime + treated)),
+    correlation = corAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_rg_full, which = "var-cov")
+```
+
+```{r}
+## Dropping the second random slope stabilizes intervals
+norm_logit_rg_split<- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdDiag(~treated)),
+    correlation = corAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_rg_split, which = "var-cov")
+```
+
+```{r}
+## Having dropped the second random slope, we can estimate the correlation between intercepts and pre-post slopes. However, the confidence intervals on the variance function (pre vs post treat variance) and residual standard error are weird. What they are saying is that at month 0, there is no residual variance; it's entirely accounted for by the random intercepts, now that they can correlate with slopes. 
+norm_logit_rg_split_1corr<- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdSymm(~treated)),
+    correlation = corCAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_rg_split_1corr, which = "var-cov")
+
+
+```
+
+```{r}
+## We see that dropping the heterogenous variance function results in significantly worse fit
+norm_logit_rg_split_1corr_homovar<- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    random = list(PATNO = pdSymm(~treated)),
+    correlation = corCAR1(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000)
+)
+print(anova(norm_logit_rg_split_1corr_homovar, norm_logit_rg_split_1corr))
+```
+
+```{r}
+## We can also fit an unstructured variance covariance matrix on the R side. Needs to be in gls() for R matrix only
+norm_logit_ronly_un<- gls(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    correlation = corSymm(form = ~ as.numeric(MONTH) | PATNO),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+print(intervals(norm_logit_ronly_un, which = "var-cov"))
+```
+
+```{r}
+## Finally, we can try adding a random intercept to the unstructured model, but it can't get a stable matrix. I tested without heterogenous variance, still didn't work
+norm_logit_un_int<- lme(
+    logit_days ~ TXNAME * treated + TXNAME * postTreatTime + SITE,
+    correlation = corSymm(form = ~ as.numeric(MONTH) | PATNO),
+    random = list(PATNO = ~ 1),
+    data = finalcoke,
+    method = "REML", na.action = na.omit,
+    control = lmeControl(maxiter = 1000, msMaxIter = 1000),
+    weights = varIdent(form = ~1|treated)
+)
+intervals(norm_logit_un_int, which = "var-cov")
+```
+
+```{r}
+#Lets compare the best G only, the best RG, and the best R only:
+#The unstructured model fits better than the RG model by AIC and LRT but not BIC.
+# It didn't really tell a different story than the RG model, saying that between the pre treatment month and all others was low correlation, but among the post treatment months, it looked like an ar(1) matrix. 
+# So I think we're fine picking the more parsinominous RG model
+print(anova(norm_logit_gonly, norm_logit_rg_split_1corr, norm_logit_ronly_un))
+best_normal_model <- norm_logit_rg_split_1corr
+```
+
+```{r}
+#Lets run diagnostics on the model:
+plot(best_normal_model)
+## Some pretty severe unmodeled heteroskedasticity. 
+## We can clearly see how the line passes through the discrete distribution at a 30 degreeish angle, inducing heteroskedasticity. I don't think there's really a way around this. 
+```
+
+```{r}
+residuals <- as.data.frame(best_normal_model$residuals)
+ggplot(data = residuals, aes(x = PATNO)) + geom_histogram()
+```
+
+```{r}
+ranefs <- as.data.frame(ranef(best_normal_model))
+ranefs <- ranefs %>% rename_at(1, ~'Intercept')
+ggplot(data = ranefs, aes(x = Intercept)) + geom_histogram()
+ggplot(data = ranefs, aes(x = treated)) + geom_histogram()
+```
+
+```{r}
+##  We see that with containment degrees of freedom, we still don't reach statistical significance. I doubt that with kenward rogers ddfm that we'd still be at alpha = .10
+print(anova(norm_logit_rg_split_1corr))
+```
+
+```{r}
+## Checking tukey adjusted means anyway, on containment df we see no significant differences, which would be true under KR degrees of freedom as well.
+library(emmeans)
+normtrends1 <- emtrends(best_normal_model, ~TXNAME, var ="treated")
+normtrends1
+pairs(normtrends1)
+
+
+```
+
+```{r}
+normtrends2 <- emtrends(best_normal_model, ~TXNAME, var ="postTreatTime")
+normtrends2
+pairs(normtrends2)
+```
+
+```{r}
+summary(best_normal_model)
+```
+
+```{r}
+intervals(best_normal_model)
+```
+
+Moving onto modeling this with logistic regression in glmmTMB(). A few notes beforehand. First, glmmTMB() does not calculate denominator degrees of freedom, just using χ squared and z tests rather than F and t tests, respectively. However, the F and t distributions converge to the Χ squared and normal distributions with increasing (denominator) degrees of freedom. The p values at 120 df for F and t are extremely similar to those at infinite df (fully converged), and so with a minimum of 300 ddf, we should be fine.
+
+Second, because logit links are far more common and interpretable to the intended audience as well as a general, as well as for space purposes, I won't be showing the probit and complementary log log links here. In testing elsewhere, I found that the probit link fit significantly worse(deviance \~ 200 larger), while the cloglog link fit significantly better than logit(deviance \~ 20 smaller), but conclusions did not differ with the cloglog link.
+
+Third, I am modeling the number of days used as a series of 30 independent trials here, where the prediction is a percentage chance of using cocaine on a particular day, independent of whether the patient used on other days. It is obviously false that for a given patient, conditional on their random effects, that the trials are not independent, due to the common binge-relapse cycle across addictions. This will be handled in several ways, depending on the model. In models with only G random effects, this will be handled by the use of the β - binomial distribution, where p (the probability of "success", here using drugs) is not treated as a constant for a given subject, but itself on a β - distribution with bounds (0,1). This is similar to the negative binomial extension to the Poisson distribution (or the Bayesian prior distribution of p for a plain binomial), and provides the added variance necessary to model correlated outcomes. The mean variance relationship in the β binomial distribution is V=μ(1−μ)(n(ϕ+n)/(ϕ+1)). Models using R matrices did not converge on the β binomial distribution, but did on the plain binomial distribution, with comparable fit statistics to the β-binomial G models. The R matrix therefore appears to capture the same over-dispersion that the β binomial model does.
+
+Finally, I will use the packages DHARMa and performance to do residual diagnostics on the selected model.
+
+```{r}
+library(glmmTMB)
+## A correlated G matrix does not converge, and we see the issue is the correlations
+betabinom_gfull <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+confint(betabinom_gfull, parm = "theta_")
+confint(betabinom_gfull, parm = "disp_")
+```
+
+```{r}
+## an uncorrelated G matrix produces stable estimates for random slopes and intercepts, unlike the normal model
+betabinom_g_uncorr <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+confint(betabinom_g_uncorr, parm = "theta_")
+confint(betabinom_g_uncorr, parm = "disp_")
+```
+
+```{r}
+## Next, the previous model with autocorrelated residuals. Note that we have to set dispformula = 0 + treated for internal reasons. However, it doesn't converge, as I mentioned would happen:
+betabinom_rg_ar1 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~0 + treated, REML = TRUE)
+confint(betabinom_rg_ar1, parm = "theta_")
+confint(betabinom_rg_ar1, parm = "disp_")
+```
+
+```{r}
+## We can try shifting to a plain binomial, which does converge. In an omitted model, the correlations between slopes and intercepts did not converge.
+
+binom_rg_ar1 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+summary(binom_rg_ar1)
+
+```
+
+```{r}
+## We can also fit a correlated G matrix to a plain binomial model, but it will fit extremely poorly compared to others. 
+binom_gfull <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+confint(binom_gfull, parm = "theta_")
+```
+
+```{r}
+## Now lets fit an unstructured matrix to a plain binomial:
+## This converges, and the correlation matrix is more or less the same as the unstructured normal model
+binom_un<- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE  + us(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+summary(binom_un)
+
+```
+
+```{r}
+## Finally, as before, we'll try adding a random intercept intercept, which converges, unlike in the normal model. In omitted testing, unstructured could not fit any random slopes. 
+binom_unint<- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE  + (1|PATNO) + us(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+confintO(binom_unint, parm = "theta_")
+summary(binom_unint)
+```
+
+```{r}
+## Now, we'll compare the best G only model with overdispersion, the  G model with correlated effects but no overdispersion, the best RG model with random slopes and residual autocorrelation, the best RG model with unstructured correlation and an intercept, and the best R only model with unstructured
+anova(betabinom_g_uncorr, binom_gfull, binom_rg_ar1, binom_un, binom_unint)
+```
+
+Here AIC and BIC diverge once again. AIC and the LRT favor the unstructured model (interestingly, the random intercept unstructured model had no additional fit, but changed interpretation). However, BIC strongly favors the RG model with random slopes and autocorrelation. As in the normal models, we saw that the unstructured model did not tell a different scientific story than the RG model, with low correlation between the pre treatment month and post treatment, and the post treatment month matrix resembling a simple autocorrelation matrix. Therefore, to reduce the risk of overfitting, and for ease of interpretation, I'll select the RG model with autocorrelation as the best model here.
+
+```{r}
+best_binom_model <- binom_rg_ar1
+```
+
+```{r}
+##DHARMa is currently all the rage. It generates a set of residuals that would be expected if the model was correct, and compares them to actual residuals to test for model errors
+
+
+library(DHARMa)
+sim_res <- simulateResiduals(best_binom_model, n = 3000)
+```
+
+```{r}
+## The model actually predicts more dispersion than there is, signficantly so. This reduces power, but also reduces type 1 error. I won't be scaling standard errors here, as doing that is somewhat fraught in mixed models. If the betabinomial model had been able to fit the full random effects, it would likely resolve this. 
+testDispersion(sim_res)
+```
+
+```{r}
+## There aren't any more outliers in the data than expected
+testOutliers(sim_res)
+```
+
+```{r}
+## The model predicts signficantly less zeroes than observed in the dataset. 
+testZeroInflation(sim_res)
+```
+
+```{r}
+## We'll see an easier on the eyes QQ plot soon. First, this shows that the model is significantly deviating from predictions.
+plot(sim_res)
+```
+
+```{r}
+library(performance)
+check_predictions(best_binom_model)
+df<- as.data.frame(check_predictions(best_binom_model))
+table_obs <- table(df$y)
+table_sim1 <- table(df$sim_1)
+table_sim2 <- table(df$sim_2)
+table_sim3 <- table(df$sim_3)
+
+freq_table <- as.data.frame(cbind(
+  Value = names(table_obs),
+  Observed = as.vector(table_obs),
+  Sim1 = as.vector(table_sim1),
+  Sim2 = as.vector(table_sim2),
+  Sim3 = as.vector(table_sim3)
+))
+(freq_table)
+```
+
+In the aggregate, the model predicts less 0s; more 1s; less 2-5, but adequate 7s 8s. The model is completely unable to replicate the spikes at 10, 15, 20, 25, and 30, but these are likely recall error. There also seems to be a slight trend of the model overpredicting high use, as in values above 10, the gaps in the lines where green, observed is lower is higher than the gaps where it is higher. While we saw that DHARMa showed significant deviation, the difference does not appear as bad here.
+
+I would expect inclusion of fixed covariates to fix much of the lack of fit overall. I did not include these, as these would have the potential to not just be confounders but causal mediators, and absent subject matter expertise I erred on the side of caution. I did not include a zero inflation submodel as while the difference is noticeable, the model predicts about 70-90% of the expected zeroes depending on the simulation, and convergence had already become an issue.
+
+```{r}
+ranefs_binom <- ranef(best_binom_model)
+```
+
+```{r}
+ggplot(data = ranefs_binom$cond$PATNO, aes(x = `(Intercept)`)) + 
+    geom_histogram()
+ggplot(data = ranefs_binom$cond$PATNO, aes(x = treated)) + 
+    geom_histogram()
+ggplot(data = ranefs_binom$cond$PATNO, aes(x = postTreatTime)) + 
+    geom_histogram()
+```
+
+```{r}
+library(car)
+Anova(best_binom_model)
+```
+
+```{r}
+print(1-pchisq(3.4659 + 2.7427,6))
+print(1-pchisq(3.466 + 2.7427 + 1,0907,9))
+
+```
+
+```{r}
+binomtrends1 <- emtrends(best_binom_model, ~TXNAME, var ="treated")
+binomtrends1
+pairs(binomtrends1)
+```
+
+```{r}
+binomtrends2 <- emtrends(best_binom_model, ~TXNAME, var ="postTreatTime")
+binomtrends2
+pairs(binomtrends2)
+```
+
+```{r}
+summary(best_binom_model)
+```
+
+```{r}
+confint(best_binom_model)
+```
