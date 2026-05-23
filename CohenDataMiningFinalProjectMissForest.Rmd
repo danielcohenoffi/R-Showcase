@@ -1,0 +1,1097 @@
+---
+title: "WDI newest"
+author: "Daniel Cohen"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "")
+```
+
+# Introduction:
+
+# Pre-processing: Pivoting and Missing Data
+
+```{r cars}
+library(caret)
+library(readr)
+library(here)
+library(factoextra)
+
+WB_WDI_WIDEF <- read_csv("WB_WDI_WIDEF.csv")
+
+```
+
+```{r}
+## Remove subnational data
+library(dplyr)
+library(tidyverse)
+WDI.totalsonly <- WB_WDI_WIDEF |>
+    filter(SEX_LABEL == "Total" &
+            AGE_LABEL == "All age ranges or no breakdown by age" &
+            URBANISATION_LABEL == "Total")
+
+```
+
+```{r}
+## Drop extraneous World Bank coding, select only variable name, country name, and values (years)
+WDI.lesscols <- WDI.totalsonly |>
+        select(INDICATOR_LABEL, REF_AREA_LABEL, `1960`:`2025`)
+```
+
+Note that of the labels that the World Bank uses for the observations, INDICATOR is a hard to interpret string of all caps letters and numbers, while INDICATOR_LABEL is a full sentence that does not take well to being printed in tables. In addition, the huge size of the dataset makes looking at all contributions of variables to models difficult, so there will be numerous workarounds here.
+
+```{r}
+colSums(is.na(WDI.lesscols))
+```
+
+That's ... 200,000 missing data points for 1960. You know that this dataset in long format was 3 GB?
+
+```{r}
+# Remove years with highest missing data
+WDI.lessyears <- WDI.lesscols |>
+    select(-c(`1960`:`1999`))
+```
+
+We saw the highest missing data rates before 2000, so I remove those years.
+
+```{r}
+
+# Step 1: Pivot years to rows
+df_long <- WDI.lessyears |>
+  pivot_longer(cols = `2000`:`2025`,
+               names_to = "year",
+               values_to = "value") |>
+  mutate(year = as.numeric(year))
+
+# Step 2: Pivot indicators to columns
+WDI.pivoted <- df_long |>
+  pivot_wider(id_cols = c(REF_AREA_LABEL, year),
+              names_from = INDICATOR_LABEL,
+              values_from = value) |>
+    rename(country = REF_AREA_LABEL)
+```
+
+```{r}
+# Get variables with high missingness
+missing_pct <- WDI.pivoted %>%
+  summarize(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+high_missing_vars <- missing_pct %>%
+  filter(pct_missing > 40) %>%
+  pull(variable)
+
+WDI.pivot.dropped.vars <- WDI.pivoted %>%
+  select(-all_of(high_missing_vars))
+
+#high_missing
+```
+
+```{r}
+# Reshape to long format for easier missingness calculation
+library(tidyr)
+
+data_long <- WDI.pivot.dropped.vars %>%
+  pivot_longer(cols = -c(country, year),
+               names_to = "indicator",
+               values_to = "value")
+
+# Missing rate by country
+missing_by_country <- data_long %>%
+  group_by(country) %>%
+  summarise(
+    miss_rate = round(mean(is.na(value)) * 100, 1),
+    n_obs = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(miss_rate))
+
+#missing_by_country
+
+```
+
+```{r}
+# Remove countries with high missing values from dataset
+high_missing_countries <- missing_by_country |>
+    filter(miss_rate > 20) |>
+    select(country)
+
+WDI.for.mice <- WDI.pivot.dropped.vars |>
+    filter_out(country %in% high_missing_countries$country)
+
+WDI.labels <- WDI.pivot.dropped.vars[1:2] # we'll need these 
+```
+
+I apologize if any of that became spaghetti code. The three dimensional nature of the code, of countries, years, and indicators, and the high rate of missing data, as well as the additional processing that the data needed for caret made this hard to follow even for me.
+
+```{r}
+nrow(WDI.labels)
+nrow(WDI.pivot.dropped.vars)
+nrow(WDI.for.mice)
+```
+
+# EDA
+
+```{r}
+missDataSummary <- as.data.frame(colSums(is.na(WDI.for.mice)))
+missDataSummary
+```
+
+```{r}
+ggplot(missDataSummary, aes(x = `colSums(is.na(WDI.for.mice))`)) + geom_histogram() + labs(title = "Distributition of Amounts of Missing Data Post Pruning", subtitle = "Even after limiting the analysis to the 21st century, whole populations, and sovereign states, substantial missing data remained") + xlab("Number of missing values (3848 total observations)") + ylab("Number of Indicators") 
+```
+
+There is still a huge amount of missing data even after filtering across years, countries, and variables.
+
+```{r}
+sum(is.na(WDI.for.mice$`Individuals using the Internet (% of population)`))
+```
+
+However, only 194 observations of the outcome of interest, the percent of people using the internet, are missing, making predictions of this variable robust.
+
+```{r}
+
+wugplot <- ggplot(data = WDI.for.mice, aes(y = `Individuals using the Internet (% of population)`, x = `GDP per capita (current US$)`, color = year)) + geom_point() +  geom_smooth(color = "red") + scale_x_log10(breaks = c(100,1000,10000,100000), labels = c("100", "1,000", "10,000", "100,000"))  + xlab("GDP Per Capita PPP , current US$, Log Scale") + ylab("Percent of Population Using the Internet") + labs(title = "Internet Usage as a Function of Income", subtitle = "Purchasing Power Parity (PPP) adjusts for real buying power of currencies, not official exchange rates", caption = "Trendline is a non-model smooth function (LOESS), and reflects nonlinearity in the relationship")
+
+wugplot
+
+ggsave("wug_plot.png", plot = wugplot, units = "in", width = 9, height = )
+
+```
+
+"
+
+The relationship between percent of individuals using the internet, and GDP per capita PPP, is clearly nonlinear even after log transformation of income. That the greatest effects of income occur at the lowest internet usages will become apparent later, during LASSO supervised learning. In general, internet adoption increases with time and income, somewhat independently. That is, high income countries had higher internet use even early in the period, while even lower income countries had increased use later in the period.
+
+```{r}
+cor(x = WDI.for.mice$year, y = WDI.for.mice$`Individuals using the Internet (% of population)`, use = "pairwise.complete.obs", method = "spearman")
+
+cor(x = WDI.for.mice$year, y = WDI.for.mice$`Individuals using the Internet (% of population)`, use = "pairwise.complete.obs", method = "pearson")
+
+cor(x = WDI.for.mice$year, y = WDI.for.mice$`Individuals using the Internet (% of population)`, use = "pairwise.complete.obs", method = "pearson")
+```
+
+```{r}
+# Rename variables for cleaner display
+key.vars <- WDI.for.mice %>%
+  select(
+    internet = `Individuals using the Internet (% of population)`,
+    agri_employment = `Employment in agriculture (% of total employment) (modeled ILO estimate)`,
+    gdp_ppp = `GDP per capita, PPP (constant 2021 international $)`,
+    services_gdp = `Services, value added (% of GDP)`,
+    labor_force = `Labor force participation rate, total (% of total population ages 15-64) (modeled ILO estimate)`,
+    fixed_phone = `Fixed telephone subscriptions`,
+    edu_spend = `Government expenditure on education, total (% of government expenditure)`,
+    stats_perf = `Statistical performance indicators (SPI): Pillar 1 data use score (scale 0-100)`,
+    year
+  )
+
+# Correlation matrix (exclude year if not needed)
+cor_matrix <- key.vars %>%
+  cor(use = "pairwise.complete.obs")
+
+```
+
+```{r}
+library(corrplot)
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "upper",
+         tl.col = "black", 
+         tl.cex = 0.8,
+         mar = c(0, 0, 2, 0),
+         title = "Correlation Matrix of Key Development Indicators")
+```
+
+Internet use is strongly positively correlated with year,performance of country's statistical indices, and GDP per capita PPP. It is strongly negatively correlated with percent of workers in agriculture.
+
+# Imputation
+
+```{r}
+
+WDI.for.caret <- WDI.for.mice
+WDI.for.caret[] <- lapply(WDI.for.mice, function(x) {
+  if(is.numeric(x)) {
+    x[is.na(x)] <- median(x, na.rm = TRUE)
+  }
+  x
+})
+# Simplest working solution
+# library(caret)
+# WDI.for.caret <- preProcess(WDI.for.mice, method = c("medianImpute"))
+
+```
+
+```{r}
+WDI.for.mice <- as.data.frame(WDI.for.mice)
+WDI.for.mice$country <- as.factor(WDI.for.mice$country)
+
+# library(missForest)
+# job::job({WDI.missForest <- missForest(WDI.for.mice, maxiter = 10, ntree = 100)
+# 
+# saveRDS(WDI.missForest, "missforest.RDS")
+# })
+    WDI.missForest <- readRDS("missforest.RDS")
+```
+
+Early in this process, I encountered errors and computational difficulties regarding missing data imputation, so I opted for median imputation for supervised learning, and a PCA algorithm robust to missing data for unsupervised learning. The commonly used mice package could neat include non numeric predictors such as country. The missForest algorithm can take country but does not understand the longitudinal nature of the data. The Amelia package explicitly models the longitudinal nature, but assumes multivariate normality of the data, which is likely false. It is worth noting that in semiparametric supervised learning (the LASSO) the missing forest algorithm produced highly confident un-regularized models, while median imputation encountered more interesting results. Given more time and resources, I would conduct a sensitivity analysis using all three of these methods, as well as imputing more of the data,
+
+# PCA
+
+```{r}
+
+high_missing <- missing_pct %>%
+  filter(pct_missing > 90) %>%
+  pull(variable)
+
+WDI.for.pca <- WDI.for.mice #%>%
+#dplyr::select(-all_of(high_missing_vars))
+
+```
+
+```{r}
+# job::job({
+# library(pcaMethods)
+# pca.nipals <- pca(WDI.for.mice, method = "nipals", nPcs = 50, center = TRUE, scale = "uv")
+# saveRDS(pca.nipals, file = "pca_result.rds")
+#})
+pca.nipals <- readRDS("pca_result.rds")
+
+```
+
+```{r}
+
+```
+
+I select 40 components to use for my clustering, which together account for 80% of the variance in the dataset while reducing variable count by 460. A reasonable smaller number would be 15 components for 67% of the variance, but the nipals algorithm was far more computationally intensive than any clustering will be (several hours overnight vs less than 10 seconds with 40 components)
+
+```{r}
+#View(pca.nipals@loadings)
+```
+
+The greatest contributors to PC1 in the negative direction are a number of measures of maternal health, energy consumption, and in the positive direction a number of measures of overall wealth, that have not been adjusted for population. PC1 is a measure of economic wealth and size. The greatest contributors to PCA2 in the negative direction are a number of measures of childhood health, and importance of agriculture in the economy, and in the positive direction, measures of income, health, and importance of services. In other words, PC2 is a measure of economic development from agricultural to services.
+
+There are a huge number of variables, but the fact that 2 components explain 33% of variance, 11 components 60% ,and 40 components 80%, indicate that many amount to duplicates.
+
+# Clustering
+
+```{r}
+library(pcaMethods)
+WDI.pca.data <- scores(pca.nipals)[, 1:40]
+
+dim(pca.nipals)
+
+dist_matrix <- dist(WDI.pca.data)
+hc_complete <- hclust(dist_matrix, method = "complete")
+hc_ward <- hclust(dist_matrix, method = "ward")
+hc_average <- hclust(dist_matrix, method = "average")
+hc_mcquitty <- hclust(dist_matrix, method = "mcquitty")
+```
+
+```{r}
+# First compute distance matrix
+dist_mat <- dist(WDI.pca.data)
+
+# Then use hcut function
+fviz_nbclust(WDI.pca.data, FUN = hcut, method = "wss", 
+             k.max = 15, hc_method = "ward.D2") +
+  labs(title = "Elbow Method - Hierarchical Clustering (Ward)")
+
+# Silhouette for hierarchical
+fviz_nbclust(WDI.pca.data, FUN = hcut, method = "silhouette",
+             k.max = 15, hc_method = "ward.D2") +
+  labs(title = "Silhouette Method - Hierarchical Clustering (Ward)")
+```
+
+*A priori* I decide to do hierarchical clustering, as it has built in sensitivity analysis, and with a variety of linkage methods, will create sensible clusters of interesting sizes.
+
+Complete, average, and McQuitty clustering methods all produce very small clusters accompanied by one cluster encompassing 99% of the observations, while Ward's produces sensible and interestingly sized clusters. In the silhouette method, the clear maximum is 2, but that is not terribly descriptive. A clear maximum after that is 10. The elbow method indicates no obvious elbow, appearing as an almost perfect inverted square root plot. Given this, I choose 10, as that is a nice round number, which should produce interesting clusters.
+
+## First Round
+
+```{r}
+clusters_10 <- cutree(hc_ward, k = 10)
+WDI.for.pca <- WDI.for.mice
+WDI.labels.forpca <- WDI.for.pca[1:2]
+
+library(dplyr)
+WDI.pca.labels <- bind_cols(
+  WDI.labels.forpca,
+  cluster = clusters_10,
+  as.data.frame(scores(pca.nipals))
+)
+WDI.pca.labels <- WDI.pca.labels[1:41]
+```
+
+```{r}
+table(WDI.pca.labels$cluster)
+```
+
+```{r}
+cluster8 <- WDI.pca.labels |> 
+    filter(cluster == 8)
+
+table(cluster8$country, cluster8$year)
+```
+
+Examining each cluster from smallest to largest, we start at cluster 8, which is India in the entire time period, and China from 2000 - 2009. This makes sense. They are the largest countries by population in the world, but have diverged substantively economically. While variables were scaled in the algorithm, they were not made per capita, so these countries will be grouped together by any metric that is just a proxy for population size.
+
+```{r}
+cluster6 <- WDI.pca.labels |> 
+    filter(cluster == 6)
+
+table(cluster6$country, cluster6$year)
+```
+
+The next smallest cluster, 6, is the United States for the entire time period, and China from 2010 on. The model is tracking China's journey from a low-middle income country to an upper-middle income, while also being the second largest economy (and largest in PPP terms). Notably, China weathered the 2008-2009 financial crisis much better than the high income world, meaning that the model may be recognizing China improving in many relative measures.
+
+Clusters 9 and 10 are modestly sized
+
+```{r}
+# cluster9 <- WDI.pca.labels.plot |> 
+#     filter(cluster == 9)
+# table(cluster9$country, cluster9$year)
+```
+
+Cluster 9 is 5 countries in southernmost Africa, for virtually the entire time period. They are in a single customs union, the Southern African Customs Union. Lesotho and Eswatini (formerly Swaziland) are largely enclaves within South Africa. Namibia was occupied by South Africa until the beginning of the end of apartheid in 1990. Botwana has a small population and imports mainly from South Africa.
+
+<https://www.britannica.com/place/Botswana/Resources-and-power>
+
+<https://www.britannica.com/place/South-Africa>
+
+```{r}
+# cluster10 <- WDI.pca.labels |> 
+#     filter(cluster == 10)
+# 
+# table(cluster10$country, cluster10$year)
+```
+
+Cluster 10 is Brazil, Indonesia, Iran and Russia for almost the entirety of the timeframe, and Vietnam from 2011 onward. These are medium-large population and economy countries, commonly members of BRICS+, though the ICS are in different clusters. It does seem a heterogenous group, with Iran and Russia having older populations and economies more dependent on services and resources, while the other three have younger populations with economies with larger agricultural and manufacturing sectors.
+
+<https://www.britannica.com/topic/BRICS>
+
+Cluster from here are larger and so tables will be omitted from the final draft
+
+```{r}
+# cluster4 <- WDI.pca.labels |> 
+#     filter(cluster == 4)
+# 
+# table(cluster4$country, cluster4$year)
+```
+
+Cluster 4 consists of Algeria, Angola, Azerbaijan, Bahrain, Brunei, the Republic of the Congo, Iraq, Kuwait, Libya, Oman, and Saudi Arabia for the entirety of the time period. The DRC visits the cluster in 2001 and Ukraine in 2024, both during major wars on their territory. These countries all have large oil reserves while not being completely dominated by the oil economy, and the majority of the population being native but not wealthy.
+
+```{r}
+# cluster1 <- WDI.pca.labels |> 
+#     filter(cluster == 1)
+# 
+# table(cluster1$country, cluster1$year)
+```
+
+Cluster 1 is a group of former Soviet and Eastern Bloc countries marked by aging populations, though their economic fortunes have differed, with Latvia Lithuania relatively developed while Ukraine and Moldova remain the poorest countries in Europe. The cluster is Albania, Armenia, Georgia, Kazakhstan, Kyrgyzstan, Mongolia, Moldova, Tajikistan, and Uzbekistan for almost all of the period. Belarus, Bosnia, Bulgarian, Latvia, Lithuania, Northern Macedonia, and Romania permanently leave the cluster in the time period of 2008-2012, a time when their growing economies weathered the global financial crisis better than the rich world. Ukraine dips in and out of the cluster.
+
+```{r}
+# cluster7 <- WDI.pca.labels |>
+#     filter(cluster == 7)
+# 
+# table(cluster7$country, cluster7$year)
+```
+
+Cluster 7 is interesting. First, in the cluster for the entire time frame are the Bahamas, Croatia, Cyprus, Czechia, Estonia, Greece Hungary, Israel, Malta, New Zealand, Poland, Portugal, Slovakia, and Slovenia. Some members of Cluster 1 that left during the financial crisis mostly joined this cluster: Belarus, Latvia, Lithuania, and Romania. Ireland enters the cluster in 2005 and leaves in 2014, on a pattern in its own. Ukraine is in the cluster in certain years, including the Maidan Revolution. The cluster then is primarily Eastern/Central/"Outer" Europe, and a few countries that share similar traits.
+
+What is particularly interesting is that a number of middle income countries primarily in central/South America or near Iberia join the cluster in just 2020, reflecting their experience of the first pandemic year: Bolivia, Cabo Verde, Columbia, the Dominican Republic, Ecuador, Jamaica, Mauritius, Morrocco, Panama, Peru, and Tunisia.
+
+```{r}
+# cluster5 <- WDI.pca.labels |>
+#     filter(cluster == 5)
+# 
+# table(cluster5$country, cluster5$year)
+```
+
+Cluster 5 is the rich world. It consists of, for the entire time frame: Austria, Australia, Belgium, Canada, Denmark, Finland, France, Germany, Iceland, Italy, Japan, South Korea, Luxembourg, the Netherlands, Norway, Singapore, Spain, Sweden, Switzerland and the UK. The only temporary member is Ireland, which spent its time not in cluster 7 here.
+
+## Second Round
+
+Clusters 2 and 3 have almost 1000 members each, and require a second round of clustering:
+
+```{r}
+# 
+# cluster23 <- WDI.pca.labels |>
+#     dplyr::filter(cluster %in% c(2,3))
+# 
+# dist23 <- dist(cluster23)
+# hc.ward.2 <- hclust(dist23, method = "ward")
+# 
+# library(factoextra)
+# 
+# # Then use hcut function
+# fviz_nbclust(cluster23, FUN = hcut, method = "wss", 
+#              k.max = 15, hc_method = "ward.D2") +
+#   labs(title = "Elbow Method - Hierarchical Clustering (Ward)")
+# 
+# # Silhouette for hierarchical
+# fviz_nbclust(cluster23, FUN = hcut, method = "silhouette",
+#              k.max = 15, hc_method = "ward.D2") +
+#   labs(title = "Silhouette Method - Hierarchical Clustering (Ward)")
+```
+
+```{r}
+library(factoextra)
+```
+
+Well, unsurprisingly The silhouette picks up on the fact that there are two clusters here. Lets do 5
+
+```{r}
+second.round <- cutree(hc.ward.2, k = 5)
+WDI.labels.forpca2.0 <- cluster23[1:3]
+
+library(dplyr)
+WDI.pca.labels2 <- bind_cols(
+  WDI.labels.forpca2.0,
+  cluster2 = second.round
+)
+```
+
+```{r}
+table(WDI.pca.labels2$cluster2, WDI.pca.labels2$cluster)
+```
+
+Almost perfectly maintained the hierarchy.
+
+```{r}
+cluster2.1 <- WDI.pca.labels2 |>
+    filter(cluster2 == 1)
+
+table(cluster2.1$year)
+```
+
+Cluster 2.1 is a little odd. No observations are from before 2020. With the vast majority being from 2025. In fact, that is honestly the best way to describe it. It is tempting to describe it in terms of political events, but it likely is just marked by a large amount of data not collected yet. It likely should have been excluded, but this is an interesting emergent property of the algorithm.
+
+```{r}
+# cluster2.2 <- WDI.pca.labels2 |>
+#     filter(cluster2 == 2)
+# 
+# table(cluster2.2$country, cluster2.2$year)
+```
+
+Cluster 2.2 ends in 2019, with most countries leaving between 2011and 2016. It is low-middle countries primarily in Latin America, North Africa, and Southeast Asia.
+
+```{r}
+# cluster3.3 <- WDI.pca.labels2 |>
+#     filter(cluster2 == 3)
+# 
+# table(cluster3.3$country, cluster3.3$year)
+```
+
+```{r}
+cluster3.4 <- WDI.pca.labels2 |>
+    filter(cluster2 == 4)
+
+table(cluster3.4$country, cluster3.4$year)
+```
+
+Clusters 3.3 and 3.4 are largely the same countries, mostly in Sub Saharan Africa or South Asia, that passed from cluster 3.4 to 3.3 at varying points during the period, reflecting their growing income and welfare. Several countries, mostly in South/Southeast Asian, spent the entire period in 3.3: Bhutan, Laos, Nepal, Nigeria, Pakistan, and Timor-Leste. Ukraine was pushed into this category during the worst of the war years in 2022 and 2023.
+
+```{r}
+# cluster2.5 <- WDI.pca.labels2 |>
+#     filter(cluster2 == 5)
+# 
+# table(cluster2.5$country, cluster2.5$year)
+```
+
+Cluster 2.5 is difficult to distinguish, largely consisting of the same middle income countries as in 2.2, but later in the period.
+
+## Clustering Conclusions
+
+The most interesting country in this period, in my opinion, was Ukraine:
+
+```{r}
+ukraine <- WDI.pca.labels |>
+    filter(country == "Ukraine") |>
+    select(year, cluster)
+kable(ukraine)
+```
+
+It spends most of its time in cluster 1, with countries with similar economic histories, on the poorer side. It joins cluster 7 at certain points, with the wealthier former Eastern Bloc countries, including during the immediate aftermath of the Maidan Revolution. The damage its society suffered during the worse of the war pushed it into the poorest group, recovering in 2024 to other middle income countries, and in 2025 having similar missing data. I don't think any other country traveled through more than 2 clusters, excluding the missing data cluster.
+
+## Cluster summary
+
+In summary:
+
+Cluster 1: Former Eastern Bloc, less wealthy, more developed leave over time
+
+Cluster 2.1 2024 and 2025, uncollected data
+
+Cluster 2.2: Low-middle income in Latin-America, North Africa, Southeast Asia, earlier in period
+
+Cluster 2.5: Same countries, later in period
+
+Cluster 3.3: Low income in Sub-Saharan Africa, South Asia, later in period
+
+Cluster 3.4: Same countries, Earlier in period
+
+Cluster 4: Petrostates
+
+Cluster 5: Rich World
+
+Cluster 6: USA and China (post 2010)
+
+Cluster 7: Eastern/Central/Outer Europe, middle income in 2020, receives leavers of cluster 1
+
+Cluster 8: India and China (pre 2010)
+
+Cluster 9: Southern Africa Customs Union
+
+Cluster 10: BRICS+ (-ICS)
+
+```{r}
+WDI.pca.labels$period <- ifelse(WDI.pca.labels$year > 2012, yes = "Post-2012", no = "Pre-2012")
+
+WDI.pca.labels <- WDI.pca.labels %>%
+  mutate(cluster_label = case_when(
+    cluster == 1 ~ "Former Eastern Bloc (Lower Income)",
+    cluster == 2 ~ "Global South, Lower-Middle Income",
+    cluster == 3 ~ "Global South, Low Income",
+    cluster == 4 ~ "Petrostates",
+    cluster == 5 ~ "Advanced Economies",
+    cluster == 6 ~ "USA & China (Post-2010)",
+    cluster == 7 ~ "Eastern/Central Europe (Middle Income)",
+    cluster == 8 ~ "India & China (Pre-2010)",
+    cluster == 9 ~ "Southern Africa Customs Union",
+    cluster == 10 ~ "BRICS+ (excl. ICS)",
+    TRUE ~ "Other"
+  ))
+
+
+
+WDI.pca.labels$cluster <- as.factor(WDI.pca.labels$cluster)
+
+WDI.pca.labels.plot <- WDI.pca.labels |>
+    filter(cluster != 8 & cluster != 6)
+# Color by cluster, shape by time period
+ggplot(WDI.pca.labels, aes(x = PC1, y = PC2,
+                         color = cluster_label,
+                         shape = period)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "Country Clusters Over Time",
+       subtitle = "US, China, and India are outliers") +
+  theme_minimal()
+
+
+USA.china.india <- WDI.pca.labels |>
+    filter(cluster == 8 | cluster == 6)
+```
+
+```{r}
+grainplot <- ggplot(WDI.pca.labels.plot , aes(x = PC1, y = PC2, 
+                         color = cluster_label)) +
+  geom_point(alpha = 0.7) +
+  labs(title = 
+           "Country Clusters Over Time: Arcs Reflect Individual Country Trajectories",
+     , color = "Cluster Assignment", 
+     subtitle = "Most countries became both wealthier and more service oriented in this time period", caption = "USA, India, and China are far to the right and below on this graph, and would do better with state/province level data") + 
+  theme_minimal() + geom_point() +  geom_jitter() + 
+    xlab("PC1: Index of Size and Wealth of Economy") + ylab("PC2: Index of Transition from Agricultural to Service Economy") + theme(text=element_text(size=20), #change font size of all text
+        axis.text=element_text(size=10), #change font size of axis text
+        axis.title=element_text(size=20), #change font size of axis titles
+        plot.title=element_text(size=20), #change font size of plot title
+        legend.text=element_text(size=10), #change font size of legend text
+        legend.title=element_text(size=10)) #change font size of legend title   
+grainplot
+ggsave("grainplot.png", plot = grainplot, unit = "in", width = 15, height = 9)
+
+```
+
+```{r}
+ggplot(USA.china.india , aes(x = PC1, y = PC2, 
+                         color = country 
+                         )) +
+  geom_point(alpha = 0.7) + 
+  labs(title = "United States, China, India")
+```
+
+The biplots clearly show the United States, China, and India (clusters 6 and 8) as massive outliers. Removing them shows that clusters are clearly space based, even in just the first 2 dimensions.
+
+```{r}
+ggplot(WDI.pca.labels.plot , aes(x = PC1, y = PC2, 
+                         color = country, 
+                         shape = period, alpha = year)) +
+  geom_point() +
+  labs(title = "Country Clusters Over Time",
+       subtitle = "Every Country it's own color") +
+  theme_minimal() + geom_jitter()
+```
+
+This awful plot shows that each of these arcs represents a single country's path in the space of the first two PCs. Each arc becomes more solid over time, and these arcs all "point" in the same direction. We saw earlier that PC1 was largely a measure of wealth, and PC2 a measure of economic development. That each becomes more solid as it travels to the upper right show that countries are increasing in both of the primary PCs over time, meaning that they are becoming wealthier and more developed.
+
+# LASSO
+
+Here, *a priori* I decide to model internet usage as a response variable, due to it being the major story of the past 25 years, and it's bounded nature creating a useful challenge.
+
+## Linear Lasso
+
+```{r}
+WDI.missForest.df <- as.data.frame(WDI.missForest$ximp)
+weights = WDI.missForest.df$`Population, total`
+
+WDI.for.caret <- WDI.missForest.df |>
+    select(-c(`Fixed broadband subscriptions (per 100 people)`,
+                `Mobile cellular subscriptions (per 100 people)`,
+            `Automated teller machines (ATMs) (per 100,000 adults)`, country))
+tc <- trainControl(method = "cv", number = 10)
+# lasso.model <- caret::train(
+# 
+#     `Individuals using the Internet (% of population)` ~ .,
+#            data = WDI.for.caret,
+#            method = "glmnet",
+#            weights = weights,
+#            tuneGrid = expand.grid(alpha = 1,
+#                                   lambda = seq(0.1, 1, 0.1)),
+#            metric = "RMSE",
+#            trControl = tc)
+# saveRDS(lasso.model ,file = "lasso_results_missforest.rds")
+lasso.model <- readRDS("lasso_results_missforest.rds")
+```
+
+```{r}
+lasso.model
+```
+
+The best model had λ = 0.6 as the best with RMSE = 10.8 and MAE =8.6. The within-sample measure of R-squared was highest with λ = 0 as expected, but performed extremely badly on cross validation with an RMSE of 11600 and MAE of 600. In this high dimensional setting of p = 500, n = 3800, unregularized regression in glmnet produces unstable coefficients and nonsensical out of sample predictions. Regularization stabilizes these predictions, getting them in range on the scale of the data itself. This reinforces the necessity of regularization in high dimensional settings
+
+```{r}
+
+tc <- trainControl(method = "cv", number = 10)
+lasso.model2 <- caret::train(
+
+    `Individuals using the Internet (% of population)` ~ `School enrollment, primary (gross), gender parity index (GPI)`,
+           data = WDI.for.caret,
+           method = "glmnet",
+           weights = weights,
+           tuneGrid = expand.grid(alpha = 1,
+                                  lambda = seq(0.1, 1, 0.1)),
+           metric = "RMSE",
+           trControl = tc)
+lasso.model2
+```
+
+```{r}
+library(ggplot2)
+ggplot(lasso.model, metric = "RMSE")
+ggplot(lasso.model, metric = "MAE")
+```
+
+The two measures of error are largely identical in their fall with increasing regularization parameter, bottoming out at 6.5.
+
+```{r}
+# Convert to regular matrix and then to data frame
+coef_matrix <- as.matrix(coef(lasso.model$finalModel, s = lasso.model$bestTune$lambda))
+coef_df <- data.frame(
+
+  coefficient = as.numeric(coef_matrix[, 1]),
+    variable = rownames(coef_matrix)
+)
+
+# Keep only nonzero coefficients (excluding intercept)
+nonzero_coefs <- coef_df %>%
+  filter(abs(coefficient) > 0.0001 & variable != "(Intercept)") %>%
+  arrange(desc(abs(coefficient)))
+
+```
+
+```{r}
+str(nonzero_coefs)
+```
+
+Looking at coefficients, we can now see that the LASSO reduced variable count from over 500 to just 79, and the first few are dummy variables for countries. Let's look deeper.
+
+```{r}
+varImp(lasso.model)
+```
+
+Interestingly, the most important variable by far for the Lasso model is gender parity in primary school.
+
+I provide below output from a model using a logit transformed measure of internet use, as an imitation of β family regression, which is currently unsupported by glmnet. This method is suggested here:
+
+Warton, D.I. and Hui, F.K.C. (2011), The arcsine is asinine: the analysis of proportions in ecology. Ecology, 92: 3-10. <https://doi.org/10.1890/10-0340.1>
+
+```{r}
+best.lasso <- lasso.model$finalModel
+predictions <- predict(lasso.model, newdata = WDI.for.caret)
+
+below.zero <- sum(predictions < 0)
+above.one <- sum(predictions > 100)
+round(100*below.zero/nrow(WDI.for.caret),2) 
+round(100*above.one/nrow(WDI.for.caret),2)
+```
+
+## Logit LASSO
+
+```{r}
+internet.prop <- WDI.for.caret$`Individuals using the Internet (% of population)`/100
+
+logit.internet <- log(internet.prop + 0.001/(0.999-internet.prop))
+```
+
+```{r}
+WDI.logit <- cbind(WDI.missForest.df, logit.internet)
+```
+
+```{r}
+weights <- WDI.logit$population_total
+tc <- trainControl(method = "cv", number = 10)
+library(job)
+job({logit.model <- caret::train(logit.internet ~ . -
+
+    `Individuals using the Internet (% of population)` - country,
+           data = WDI.logit,
+           method = "glmnet",
+           weights = weights,
+           tuneGrid = expand.grid(alpha = seq(1),
+                                  lambda = seq(0.1, 1, 0.1)),
+           metric = "RMSE",
+           trControl = tc)
+saveRDS(logit.model ,file = "logit_lasso_results_missforest.rds")
+logit.model <- readRDS("logit_lasso_results_missforest.rds") })
+```
+
+```{r}
+library(job)
+```
+
+The best model now has a λ of 0.1.
+
+```{r}
+library(tidyverse)
+# Convert to regular matrix and then to data frame
+coef_matrix_logit <- as.matrix(coef(logit.model$finalModel, s = logit.model$bestTune$lambda))
+coef_df <- data.frame(
+  variable = rownames(coef_matrix_logit),
+  coefficient = as.numeric(coef_matrix_logit[, 1])
+)
+
+# Keep only nonzero coefficients (excluding intercept)
+nonzero.coefs.lasso <- coef_df %>%
+  filter(abs(coefficient) > 0 & variable != "(Intercept)") %>%
+  arrange(desc(abs(coefficient)))
+```
+
+```{r}
+(varImp(logit.model))
+```
+
+Variable selection is notably different, due to the shifting scale. The logit model puts much more weight on the differences between 0% to 10% and 90% to 100% than for 40%-60%, so these variables are more important in detecting those differences. The linear model by contrast weighted all differences equally by percentage point.
+
+Lets look at how the models differ. In 2002, 0% of Timor-Leste's population used the internet, observation 3201. In 2021, 99.7% of Iceland's population used the internet, observation 464, and in 2001, 49.1% of the United States' population used the internet, observation 132.
+
+```{r}
+example <- WDI.missForest.df[c(3201,464,132),]
+rawpred <- predict(lasso.model, example)
+transpred <- predict(logit.model, example)
+transpred <- 100 * (exp(transpred) / (1 + exp(transpred)))
+
+```
+
+```{r}
+rawpred
+transpred
+```
+
+From these three examples, the linear model predicts impossible but close values for Timor and Iceland, and very close for the United States. The transformed model predicts only possible results, but from these examples the errors are larger than the linear.
+
+```{r}
+# Get all predictions from both models
+linear_pred <- predict(lasso.model, newdata = WDI.missForest.df)
+logit_pred_raw <- predict(logit.model, newdata = WDI.missForest.df)
+logit_pred_pct <- exp(logit_pred_raw) / (1 + exp(logit_pred_raw)) * 100
+
+# Actual values
+actual <- WDI.missForest.df$`Individuals using the Internet (% of population)`
+
+# Calculate MSE for both
+linear_mse <- mean((actual - linear_pred)^2)
+logit_mse <- mean((actual - logit_pred_pct)^2)
+linear_mae <- mean(abs(actual-linear_pred))
+logit_mae <- mean(abs(actual-logit_pred_pct))
+
+# Also RMSE for interpretability
+linear_rmse <- sqrt(linear_mse)
+logit_rmse <- sqrt(logit_mse)
+
+# Create comparison table
+mse_comparison <- data.frame(
+  Model = c("Linear LASSO", "Logit LASSO"),
+  RMSE = c(linear_rmse, logit_rmse),
+  MAE = c(linear_mae, logit_mae)
+)
+
+mse_comparison
+```
+
+What we see here suggests that our examples were not random chance. On the original scale, the transformed model does far worse, with over double the RMSE and MAE.
+
+```{r}
+
+```
+
+The conclusions are clear. Overall, the linear model predicts better. Where the logit model shines is at very low internet use, less than 10%, where the it has about one third the error as the linear model, and produces no out of bounds predictions. The logit model produces errors about 80% of the linear from internet uses from 10-30% usage, but much larger errors beyond that.
+
+```{r}
+data_2020s <- WDI.pivoted |>
+    filter(year %in% 2020:2025) |>
+    select(`Individuals using the Internet (% of population)`, year) 
+quantile(data_2020s, na.rm = TRUE, probs = seq(0,.05,by = .01))
+```
+
+While the logit-transformed model respects the theoretical bounds of the outcome variable, the linear LASSO model demonstrates superior predictive performance for the vast majority of observations (\>95% of post 2000 data). Given that our primary goal is prediction accuracy for future observations,which are unlikely to fall below 10-30% internet usage,the linear model is preferred. I noted above, before running the logit model, that I expected the linear model to do worse before 2000 than after 2025. Therefore, the logit model remains valuable for historical analysis of very low-usage periods or countries.
+
+```{r}
+varImp(random.forest)
+```
+
+# Nonparametric Methods
+
+```{r}
+library(missForest)
+library(caret)
+library(parallel)
+library(doParallel)
+
+total_cores <- detectCores()
+compute_cores <- total_cores - 1  
+cl <- makeCluster(compute_cores)
+registerDoParallel(cl)
+
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  allowParallel = TRUE  )
+```
+
+```{r}
+# Clean the data completely
+WDI_clean <- WDI.missForest.df %>%
+  rename(
+    internet_pct = `Individuals using the Internet (% of population)`,
+    population = `Population, total`
+  ) %>%
+  # Remove problematic columns
+  select(-starts_with("Fixed broadband"),
+         -starts_with("Mobile cellular"),
+         -starts_with("Automated teller machines"),
+         -`Access to electricity (% of population)`,-year)  # Remove identifiers now
+
+names(WDI_clean) <- make.names(names(WDI_clean))
+```
+
+```{r}
+library(rpart)
+library(caret)
+
+library(rpart.plot)
+WDI_clean <- WDI_clean |>
+    
+rename(
+  "PPP Consumption PC " = "Households.and.NPISHs.Final.consumption.expenditure.per.capita..PPP..current.international...",
+  "Stat Perform" = "Statistical.performance.indicators..SPI...Pillar.1.data.use.score..scale.0.100."      ,
+  "Net Nat Income pc" = "Adjusted.net.national.income.per.capita..current.US..",
+   "Stat Perform" = "Statistical.performance.indicators..SPI...Pillar.1.data.use.score..scale.0.100." ,
+  "Health Spend PC" = "Current.health.expenditure.per.capita..current.US..",
+ "GDP PC PPP" = "GDP.per.capita..PPP..current.international...", 
+ "Fossil Fuel %" = "Fossil.fuel.energy.consumption....of.total."      
+  
+)
+
+# Fit the tree
+tree_model <- rpart(internet_pct ~ . - country,
+                    data = WDI_clean,
+                    control = rpart.control(cp = 0.01, maxdepth = 5))
+
+```
+
+```{r}
+prp(tree_model, 
+    extra = 101, 
+    fallen.leaves = TRUE, 
+    main = "Decision Tree",
+    varlen = 0,
+    type = 2, # Different text placement
+    under = TRUE,
+    faclen = 0,
+    roundint = FALSE,
+    digits = 4,
+    cex = 0.6,             # Even smaller
+    compress = FALSE)
+
+```
+
+```{r}
+tree_model$frame[tree_model$frame$var != "<leaf>", "var"]
+```
+
+```{r}
+
+```
+
+```{r}
+tree_model$frame$var <- name_map[tree_model$frame$var]
+tree_model$frame$var[is.na(tree_model$frame$var)] <- "<leaf"
+```
+
+```{r}
+prp(tree_model, extra = 101, fallen.leaves = TRUE, main = "Decision Tree",
+    type = 5, under = TRUE, cex = 0.6, compress = FALSE)
+```
+
+n omitted code, this decision tree repeatedly crashed when given a complexity parameter of zero.
+
+The best decision tree had the lowest generated nonzero complexity parameter, of 0.0081. It has an R-square of .75, worse than the Lasso with .88, and an RMSE of 15.9, compared to the best LASSO's 10.8. The MAE is 11.6, compared to the LASSO's 8.6. The decision tree performs worse by every metric. But what it does have is simplicity.
+
+```{r}
+
+# Get all predictions from both models
+
+tree_pred <- predict(decision.tree, newdata = WDI_clean)
+forest_pred <- predict(random.forest, newdata = WDI_clean)
+
+# Actual values
+actual <- WDI.missForest.df$`Individuals using the Internet (% of population)`
+
+
+# Create error dataframe
+error_df <- data.frame(
+  actual = actual,
+  tree_error = actual - tree_pred,
+  forest_error = actual - forest_pred
+)
+
+# Add range category
+error_df <- error_df %>%
+  mutate(
+    range = case_when(
+      actual < 10 ~ "0-10%",
+      actual < 30 ~ "10-30%",
+      actual < 50 ~ "30-50%",
+      actual < 70 ~ "50-70%",
+      actual < 90 ~ "70-90%",
+      TRUE ~ "90-100%"
+    )
+  )
+
+# MSE by range
+mse_by_range <- error_df %>%
+  group_by(range) %>%
+  summarise(
+    n = n(),
+    tree_mse = mean(tree_error^2, na.rm = TRUE),
+    forest_mse = mean(forest_error^2, na.rm = TRUE),
+    tree_rmse = sqrt(tree_mse),
+    forest_rmse = sqrt(forest_mse),
+    tree_mae = mean(abs(tree_error)),
+    forest_mae = mean(abs(forest_error)),
+    
+    
+    
+    .groups = "drop"
+  ) |>
+    select(-tree_mse, -forest_mse)
+
+mse_by_range
+```
+
+```{r}
+library(rpart.plot)
+prp(decision.tree$finalModel,
+    type = 5,
+    cex = 1,
+    extra = 100, 
+    under = TRUE,
+    trace = TRUE)
+```
+
+```{r}
+prp(decision.tree$finalModel, cex = 10)
+```
+
+This is the decision tree. Yep, that's it. It predicts the highest internet rates (85%) for those with GDP per capita in purchasing power parity (PPP, a currency exchange adjusted measure of income), greater than \$21,000, an import value index greater than 88, and a statistical performance indicator index greater than 65, and predicts 12% of observations have 85% use.
+
+It predicts the lowest internet rates (4.3%) for those with adjusted net national income per capita less than \$1603, and a GDP deflator index less than 99, indicating an economy valued less in nominal terms than real terms, or in other words, a shrinking economy or one with a currency increasing in value.
+
+<https://www.investopedia.com/terms/g/gdppricedeflator.asp>
+
+```{r}
+varImp(decision.tree)
+```
+
+The most important variables for the decision tree, were, in order:
+
+1.  The consumer price index, a measure of relative inflation in a given country over time
+
+2.  Statistical Performance Index, a statistic measuring how well a country's statistics gathering systems. This makes sense. More internet and more data go hand in hand
+
+3.  Livestock production Index. Likely a measure of wealth
+
+4.  Adjsusted net income per capita, a direct measure of wealth.
+
+    Beyond that is various other measurements that amount to one of the previous listed. That livestock production did not occur in the final model, but GDP per capita PPP did simply means that livestock raising was a useful measurement before pruning. A more complex tree would then include that measurement at some point. Again, more complex trees failed to run.
+
+We can also fit a random forest, but need to limit the number of variables used to save computation time, and interpret the model in any way:
+
+```{r}
+job({random.forest3 <- train( internet_pct ~ .,
+                       method = "rf",
+                       weights = WDI_clean$population,
+                       data = WDI_clean,
+                       tuneGrid = expand.grid(mtry = 2:8))
+
+
+saveRDS(random.forest3, file = "random_forest3")})
+
+```
+
+```{r}
+random.forest3
+```
+
+```{r}
+
+```
+
+```{r}
+varImp(lasso.model)
+```
+
+```{r}
+ggplot(lasso.model)
+```
+
+```{r}
+random.forest <-readRDS(file = "random_forest.RDS")
+random.forest
+```
+
+A random forest with incorrectly coded mtry(number of variables included) left running overnight landed on an optimal model of 247 predictors, likely overfit. What is of more interest is the model with just 2 predictors. It fits substantially better than even the LASSO, with 82 predictors. This amounts to is a nonlinear spline
+
+```{r}
+varImp(random.forest)
+```
+
+By far the most important predictor for the random forest was GNI per capita PPP, again, followed by household expenditure per capita PPP. This is to say, the random forest essentially formed a semiparametric spline as an emergent property. This could be overfit to the data. At the same time, we saw in the LASSO discussion that a model that explicitly nonlinearly model for very low internet use rates was able to predict substantially better in said regions. The relationship of income to internet use is likely S-shaped, with substantial initial outlays on infrastructure necessary to initiate use, followed by an almost linear increase, followed again with slowing increase in absolute terms as the percentage of users approaches 100%.
+
+# Conclusions:
+
+Upon correctly pivoting this dataset of World Bank Development Indicators into the necessary format, I pruned substantial amounts of observatuons, owing to large rates of missing data in all three dimensions of the dataset: from years before 2000, from regional aggregations and non-sovereign dependencies, and from 500 measures with high rates of missing data, as well as any data collected on population subsets. Given the scale and structure of the dataset, multiple imputation for even this subest was not feasible for supervised learning, but I used a principle components analysis algorithm robust to missing data for the purposes of clustering. Clustering revealed groupings of countries across space and time, recreating major economic trends in this period, including the rise of China to a peer of the United States, broad economic growth in the Global South and former Eastern Bloc, and Ukraine's turbulent post-2012 experience.
+
+I selected internet usage as percent of the population as a response variable of interest, owing to it arguably being the biggest story of the last 25 years, and its bounded nature presenting a useful challenge. I fit multiple LASSO regularized regression models to it, finding that a logit-transformed model performed better for lower internet use rates, but a linear model better for higher rates. Notably, the linear model observed a number of countries with outlier internet usage rates, considering their other characteristics. A simple decision tree found that internet usage rates were largely a function of income and data gathering operations, albeit at the cost of worse performance than the LASSO. Finally, I fit a random forest, which found that internet usage could near-perfectly be predicted by a nonlinear function of income, consistent with the LASSO findings.
+
+```{r}
+library(report)
+cite_packages()
+```
