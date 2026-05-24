@@ -1,0 +1,1417 @@
+---
+title: "Norm and RG binom models"
+author: "Daniel Cohen"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+For technical audiences only.
+
+```{r setup}
+library(emmeans)
+## import and modify data
+library(haven)
+library(here)
+library(haven)
+library(dplyr)
+setwd('/Users/danielcohen/Desktop/R_Code')
+finalcoke <- read_sas("finalcokeup.sas7bdat", NULL)
+# finalcoke$cokedays <- finalcoke$DAYSUSED
+# finalcoke$DAYSUSED <- finalcoke$ALCDAYS
+finalcoke$MONTH <- as.factor(finalcoke$MONTH)
+finalcoke$PATNO <- as.factor(finalcoke$PATNO)
+finalcoke$TX_COND <- as.character(finalcoke$TX_COND)
+finalcoke$TXNAME <- dplyr::recode(finalcoke$TX_COND, 
+                        "1" = "IDC", 
+                        "2" = "CT",
+                        "3" = "SE",
+                        "4" = "GDC")
+
+library(dplyr)
+finalcoke$HAM27int <- round(finalcoke$HAM27)
+
+finalcoke$logit_days <- log((finalcoke$DAYSUSED +1) / (30 - finalcoke$DAYSUSED + 1))
+finalcoke$log_days<- log(finalcoke$DAYSUSED + 1)
+  
+
+timetxMeans <- finalcoke |> group_by(TXNAME, MONTH) |>
+    select(DAYSUSED, PATNO, SITE, GENDER, logit_days) |>
+    mutate(mean_days = mean(DAYSUSED, na.rm = TRUE), sd_days = sd(DAYSUSED, na.rm = TRUE), mean_logit_days = mean(logit_days, na.rm = TRUE), sd_logit_days = sd(logit_days) )
+
+timetxMeans$logitmeandays <- log((timetxMeans$mean_days + .1)/(30.1-timetxMeans$mean_days))
+
+timetxMeans$logitdays <- log((timetxMeans$DAYSUSED + 1)/(30.1-timetxMeans$DAYSUSED))
+
+finalcoke$treated<- ifelse(test = finalcoke$MONTH == 0, yes = 0, no = 1)
+
+finalcoke$postTreatTime <- ifelse(test = finalcoke$MONTH %in% c(0,1), yes = 0, no = as.numeric(finalcoke$MONTH) -1 ) 
+
+finalcoke$logit_days <- log((finalcoke$DAYSUSED +1) / (30 - finalcoke$DAYSUSED + 1))
+finalcoke$log_days<- log(finalcoke$DAYSUSED + 1)
+  
+finalcoke$logmonth <- log(as.numeric(finalcoke$MONTH) + 1)
+
+finalcoke$HAM27altered <- ifelse(finalcoke$HAM27 == 50, yes = 49.9, no = finalcoke$HAM27)
+
+finalcoke$HAM27altered2 <- ifelse(finalcoke$HAM27altered == 0, yes = 0.1, no = finalcoke$HAM27altered)
+finalcoke$month.num <- as.numeric(finalcoke$MONTH)
+```
+
+```{r}
+finalcoke$forbeta <- (finalcoke$DAYSUSED + 0.5) / 31
+```
+
+```{r}
+library(glmmTMB)
+betanudge <- glmmTMB(forbeta ~ TXNAME * (treated + postTreatTime) + SITE +  (treated||PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = beta_family(link = "logit"), REML = TRUE)
+```
+
+```{r}
+summary(betanudge)
+```
+
+```{r}
+library(car)
+Anova(betanudge)
+```
+
+```{r}
+library(emmeans)
+nudgetrends <- emtrends(betanudge, specs = ~ TXNAME, var = "treated")
+pairs(nudgetrends)
+```
+
+```{r}
+finalcoke$orig <- log(finalcoke$DAYSUSED + 1)
+
+```
+
+```{r}
+logshift <- glmmTMB(orig ~ TXNAME * (treated + postTreatTime) + SITE +  (treated ||PATNO), data = finalcoke, family = t_family(), REML = TRUE)
+Anova(logshift)
+```
+
+```{r}
+logtrends <- emtrends(logshift, specs = ~ TXNAME, var = "treated")
+pairs(logtrends)
+```
+
+```{r}
+library(job)
+library(brms)
+library(glmmTMB)  # for comparison models
+
+finalcoke$prop <- (finalcoke$DAYSUSED + 0.01) / 30.02
+# Model 1: Beta-binomial with cloglog link (your original approach)
+job::job({
+  model_brms_cll <- brm(
+    bf(
+      DAYSUSED | trials(30) ~ TXNAME * (treated + postTreatTime) + SITE + 
+        (treated + postTreatTime || PATNO),
+      autocor = ~ ar(time = MONTH, gr = PATNO, cov = TRUE)
+    ),
+    data = finalcoke,
+    family = beta_binomial(link = "cloglog"),
+    chains = 8,
+    cores = 4,
+    seed = 123,
+    warmup = 2000,
+    iter = 5000,
+    init = 0,
+    control = list(adapt_delta = 0.99, max_treedepth = 15)
+  )
+  
+  saveRDS(model_brms_cll, file = "model_brms_cll.rds")
+
+
+# Model 2: Beta regression on nudged proportions (for comparison)
+  model_brms_beta <- brm(
+    bf(
+        prop ~ TXNAME * (treated + postTreatTime) + SITE + 
+        (treated + postTreatTime || PATNO),
+      autocor = ~ ar(time = MONTH, gr = PATNO, cov = TRUE)
+    ),
+    data = finalcoke,
+    family = Beta(link = "cloglog"),
+    chains = 8,
+    cores = 4,
+    seed = 123,
+    warmup = 2000,
+    iter = 5000,
+    init = 0,
+    control = list(adapt_delta = 0.99, max_treedepth = 15)
+  )
+  
+  saveRDS(model_brms_beta, file = "model_brms_beta.rds")
+
+
+# Model 3: LMM on log-shifted days (to match original publication)
+# Create log-shifted outcome
+finalcoke$logshift <- log(finalcoke$DAYSUSED + 1)
+
+
+  model_brms_logshift <- brm(
+    bf(
+      logshift ~ TXNAME * (treated + postTreatTime) + SITE + 
+        (treated + postTreatTime || PATNO),
+      autocor = ~ ar(time = MONTH, gr = PATNO, cov = TRUE)
+    ),
+    data = finalcoke,
+    family = gaussian(),
+    chains = 8,
+    cores = 4,
+    seed = 123,
+    warmup = 2000,
+    iter = 5000,
+    init = 0,
+    control = list(adapt_delta = 0.99, max_treedepth = 15)
+  )
+  
+})
+```
+
+```{r}
+summary(model_brms_beta)
+```
+
+```{r}
+
+bayes_R2(model_brms) #   Estimate   Est.Error      Q2.5     Q97.5
+#R2 0.9276136 0.006459795 0.9137795 0.9387873
+loo_R2(model_brms) #    Estimate  Est.Error      Q2.5     Q97.5
+#R2 0.8330299 0.00820462 0.8164789 0.8481814
+```
+
+```{r}
+library(glmmTMB)
+
+simvals <- (round(rbeta(10000, 1, 29)*30))
+
+simvalsdf <- as.data.frame(simvals)
+
+
+testmodel <- glmmTMB(cbind(simvals, 30-simvals) ~ 1, data = simvalsdf, family = betabinomial() )
+summary(testmodel)
+```
+
+```{r}
+summary(testmodel)
+```
+
+```{r}
+library(brms)
+testmodelbrms <- brm(
+  bf(
+    simvals| trials(30) ~ 1
+  ),
+  data = simvalsdf,
+  family = beta_binomial(link = "cloglog"),
+  chains = 8,
+  cores = 4,
+  seed = 123,
+  warmup = 100,
+  iter = 200 # Start at zero instead of random initial values
+)
+    
+```
+
+```{r}
+summary(testmodelbrms)
+```
+
+```{r}
+
+# model_brms_cll <- readRDS("model_brms_cll.rds")
+# library(emmeans)
+# 
+# brms.trends.cll <- emtrends(model_brms_cll, specs = ~ TXNAME, var = "treated")
+
+# 
+# brms.trends.beta <- emtrends(model_brms_beta, specs = ~1, var = "postTreatTime", at = list(treated = 0))
+# brms.trends.beta
+# 
+# 
+# brms.trends.lmm <- emtrends(model_brms_logshift, specs = ~ 1, var = "postTreatTime", at = list(treated = 0))
+# brms.trends.lmm
+
+```
+
+```{r}
+# brms.means.cll1 <- emmeans(model_brms_cll, specs = ~ TXNAME*postTreatTime, by = "TXNAME", at = list(postTreatTime = c(0,1,2,3,4,5), treated = 0), type = "response")
+summary.cll <- summary(brms.means.cll1)
+summary.cll$prob <- summary.cll$prob * 30
+summary.cll$lower.HPD <- summary.cll$lower.HPD * 30
+summary.cll$upper.HPD <- summary.cll$upper * 30
+
+
+```
+
+```{r}
+library(ggplot2)
+ggplot(summary.cll, aes(x = postTreatTime, y = prob)) + geom_pointrange(ymin = summary.cll$lower.HPD, ymax = summary.cll$upper.HPD) + facet_wrap(~ TXNAME) + scale_y_continuous(limits = c(3,10)) + xlab("Months of Additional Treatment") + ylab("Median Days Using Drugs") + labs(title = "Projected Improvements for Additional Treatment") + geom_line()
+```
+
+```{r}
+library(performance)
+check_predictions(model_brms_cll, type = "discrete_both")
+```
+
+```{r}
+# Get predicted probabilities for each patient at each time point
+job::job({predictions <- fitted(model_brms_cll, 
+                      newdata = finalcoke,
+                      re_formula = NA,  # marginal over random effects
+                      scale = "response")  # converts to proportion scale
+
+# Multiply by 30 to get days
+finalcoke$predicted_days <- predictions[,1] * 30 })
+
+# # Now average by TXNAME and MONTH
+# library(dplyr)
+# trends_summary <- finalcoke %>%
+#   group_by(TXNAME, MONTH) %>%
+#   summarise(mean_days = mean(predicted_days, na.rm = TRUE)
+```
+
+```{r}
+check_predictions(model_brms)
+```
+
+```{r}
+brms.resids <- residuals(model_brms, type = "pearson")
+```
+
+```{r}
+ggplot(data = brms.resids, aes(x = Q2.5)) + geom_histogram()
+```
+
+```{r}
+summary(brms.resids)
+```
+
+```{r}
+vcov(model_brms)
+```
+
+```{r}
+# library(ordinal)
+# library(job)
+# job::job({
+# ordinalmod.corr <- clmm( as.factor(DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime| PATNO) , data = finalcoke)
+# })
+
+write.csv(finalcoke, file = "updated")
+```
+
+```{r}
+library(glmmTMB)
+altbeta.model <- glmmTMB(((DAYSUSED + 0.1)/31) ~ (treated + postTreatTime) * TXNAME + SITE + (treated + postTreatTime||PATNO), data = finalcoke, family = beta_family(), dispformula = ~ treated)
+```
+
+```{r}
+library(emmeans)
+library(car)
+Anova(altbeta.model)
+
+altbeta.trends <- emtrends(altbeta.model, specs = ~ TXNAME, var = "treated")
+altbeta.trends
+pairs(altbeta.trends)
+
+
+
+```
+
+```{r}
+ordinal.trends.corr <- emtrends(ordinalmod.corr, specs = ~ TXNAME, var = "treated")
+ordinal.trends.corr
+pairs(ordinal.trends.corr)
+
+
+```
+
+```{r}
+ordinal.trends2.corr <- emtrends(ordinalmod.corr, specs = ~ 1, var = "postTreatTime")
+ordinal.trends2.corr
+pairs(ordinal.trends2.corr)
+```
+
+```{r}
+finalcoke$treated2<- ifelse(test = finalcoke$MONTH %in% c(0,1,2), yes = 0, no = 1)
+
+finalcoke$postTreatTime2 <- ifelse(test = finalcoke$MONTH %in% c(0,1,2), yes = 0, no = as.numeric(finalcoke$MONTH) -1 ) 
+```
+
+```{r}
+library(ggplot2)
+ggplot(data = finalcoke, aes(x = DAYSUSED)) + geom_histogram() + facet_wrap(~TXNAME)
+```
+
+```{r}
+library(knitr)
+table(finalcoke$DAYSUSED)
+```
+
+```{r}
+library(ggplot2)
+finalcoke$month.plot <- as.numeric(finalcoke$MONTH) -1
+## plot data with LOESS
+ggplot(data = finalcoke, aes(x = postTreatTime,
+                               y = DAYSUSED, color = TXNAME))  + geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+library(ggplot2)
+timetxMeans$month.plot <- as.numeric(timetxMeans$MONTH) -1
+## variance changes over time, no clear differences in treatment. 
+ggplot(data = timetxMeans, aes(x = month.plot,
+                               y = mean_days, color = TXNAME)) +
+    geom_point() + geom_line() + labs(title = "Days Used per Month, on Average, Over Time", x = "Month")  +  ylab( "Average Days by Treatment Group") 
+```
+
+```{r}
+## variance changes over time, no clear differences in treatment. 
+ggplot(data = timetxMeans, aes(x = as.numeric(MONTH),
+                               y = sd_days, color = TXNAME)) +
+    geom_point() 
+```
+
+```{r}
+## There's some difference in variance across sites. It really seems to be Mclean vs not. 
+library(dplyr)
+siteMeans <- finalcoke |> group_by(SITE, MONTH) |>
+    select(DAYSUSED, PATNO, SITE, GENDER) |> 
+    mutate(mean_days = mean(DAYSUSED, na.rm = TRUE), sd_days = sd(DAYSUSED, na.rm = TRUE))
+
+ggplot(siteMeans, aes(x = MONTH, y = sd_days, color = SITE)) + geom_point()
+```
+
+```{r}
+
+library(glmtoolbox)
+# 
+ days_gee1 <- glmgee(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE, data = finalcoke, corst = "Unstructured", id = PATNO, waves = month.num, family = quasibinomial(link = "logit"), na.action = na.omit)
+
+```
+
+```{r}
+summary(days_gee1)
+```
+
+```{r}
+anova(days_gee1)
+```
+
+```{r}
+summary(days_gee1)
+```
+
+```{r}
+ days.gee2 <- glmgee(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME + SITE, data = subset(finalcoke, MONTH == 6),, id = PATNO, family = quasibinomial(link = "logit"), na.action = na.omit)
+ summary(days.gee2)
+```
+
+```{r}
+# finalcoke$month.num <- as.numeric(finalcoke$MONTH)
+# library(geepack)
+# gee.null <- geeglm(formula = cbind(DAYSUSED, 30 - DAYSUSED) ~ 1, family = quasibinomial(link = "logit"), id = PATNO, waves = month.num, corstr = "unstructured", data = finalcoke, na.action = na.omit)
+# summary(gee.null)
+```
+
+Moving onto modeling this with logistic regression in glmmTMB(). A few notes beforehand. First, glmmTMB() does not calculate denominator degrees of freedom, just using χ squared and z tests rather than F and t tests, respectively. However, the F and t distributions converge to the Χ squared and normal distributions with increasing (denominator) degrees of freedom. The p values at 120 df for F and t are extremely similar to those at infinite df (fully converged), and so with a minimum of 300 ddf, we should be fine.
+
+Second, because logit links are far more common and interpretable to the intended audience as well as a general, as well as for space purposes, I won't be showing the probit and complementary log log links here. In testing elsewhere, I found that the probit link fit significantly worse(deviance \~ 200 larger), while the cloglog link fit significantly better than logit(deviance \~ 20 smaller), but conclusions did not differ with the cloglog link.
+
+Third, I am modeling the number of days used as a series of 30 non-independent trials trials here, where the prediction is a percentage chance of using cocaine on a particular day, independent of whether the patient used on other days. It is obviously false that for a given patient, conditional on their random effects, that the trials are not independent, due to the common binge-relapse cycle across addictions. This will be handled in several ways, depending on the model. In models with only G random effects, this will be handled by the use of the β - binomial distribution, where p (the probability of "success", here using drugs) is not treated as a constant for a given subject, but itself on a β - distribution with bounds (0,1). This is similar to the negative binomial extension to the Poisson distribution (or the Bayesian prior distribution of p for a plain binomial), and provides the added variance necessary to model correlated outcomes. The mean variance relationship in the β binomial distribution is V=μ(1−μ)(n(ϕ+n)/(ϕ+1)). Models using R matrices did not converge on the β binomial distribution, but did on the plain binomial distribution, with comparable fit statistics to the β-binomial G models. The R matrix therefore appears to capture the same over-dispersion that the β binomial model does.
+
+```{r}
+library(glmmTMB)
+## A correlated G matrix only converges with homogenous variance
+betabinom_gfull <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime| PATNO), data = finalcoke, family = betabinomial(link = "logit"), REML = TRUE)
+confint(betabinom_gfull, parm = "theta_")
+confint(betabinom_gfull, parm = "disp_")
+```
+
+```{r}
+## an uncorrelated G matrix can give estimates on the heterogenous variance, which we see is significantly different than zero. 
+library(glmmTMB)
+betabinom_g_uncorr <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+confint(betabinom_g_uncorr, parm = "theta_")
+confint(betabinom_g_uncorr, parm = "disp_")
+
+
+
+```
+
+```{r}
+library(job)
+library(brms)
+
+job::job({
+# Fit the model
+model_brms <- brm(
+  bf(
+    DAYSUSED | trials(30) ~ TXNAME * (treated + postTreatTime) + SITE + 
+      (treated + postTreatTime || PATNO),
+    autocor = ~ ar(time = MONTH, gr = PATNO, cov = TRUE)
+  ),
+  data = finalcoke,
+  family = beta_binomial(link = "logit"),
+  chains = 8,
+  cores = 4,
+  iter = 4000,           # Total iterations (warmup + sampling)
+  warmup = 2000,         # More warmup to adapt
+  thin = 2,              # Reduce autocorrelation
+  seed = 123,
+  control = list(adapt_delta = 0.95)
+)})
+
+
+```
+
+```{r}
+job::job({
+# Fit the model
+model_brms_corr <- brm(
+  bf(
+    DAYSUSED | trials(30) ~ TXNAME * (treated + postTreatTime) + SITE + 
+      (treated + postTreatTime | PATNO),
+    autocor = ~ ar(time = MONTH, gr = PATNO, cov = TRUE)
+  ),
+  data = finalcoke,
+  family = beta_binomial(link = "logit"),
+  chains = 8,
+  cores = 4,
+  iter = 5000,           # Total iterations (warmup + sampling)
+  warmup = 2000,         # More warmup to adapt
+  thin = 2,              # Reduce autocorrelation
+  seed = 123,
+  control = list(adapt_delta = 0.95)
+)})
+
+```
+
+```{r}
+saveRDS(model_brms, file = "model_brms_2")
+summary(model_brms)
+```
+
+```{r}
+library(emmeans)
+brms.trends1 <- emtrends(model_brms, specs = ~ TXNAME, var = "treated")
+pairs(brms.trends1, adjust = "none")
+pairs(brms.trends1, adjust = "tukey")
+brms.trends1
+```
+
+```{r}
+brms.trends2 <- emtrends(model_brms, specs = ~1, var = "postTreatTime")
+brms.trends2
+```
+
+```{r}
+conditions <- data.frame(treated = c(-1, 0))
+conditional_effects(model_brms, "TXNAME", conditions = conditions)
+```
+
+```{r}
+glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime| PATNO) + ar1(0 + MONTH|PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+```
+
+```{r}
+betabinom_g_uncorr_notx <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ (treated + postTreatTime ) + (treated + postTreatTime|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+```
+
+```{r}
+bbinom.means <- emmeans(betabinom_g_uncorr, specs = ~ TXNAME*treated, type = "response")
+kable(bbinom.means)
+```
+
+```{r}
+bbinom.trends <- emtrends(betabinom_g_uncorr, specs = ~ TXNAME, var = "treated")
+kable(pairs(bbinom.trends))
+```
+
+```{r}
+bbinom.trends2 <- emtrends(betabinom_g_uncorr, specs = ~ 1, var = "postTreatTime", at = list(treated = 1))
+bbinom.trends2
+```
+
+```{r}
+betabinom.g.homvar <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), REML = TRUE)
+confint(betabinom.g.homvar, parm = "theta_")
+confint(betabinom.g.homvar, parm = "disp_")
+```
+
+```{r}
+betabinom.rg.homvar <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO) + ar1(MONTH + 0|PATNO), data = finalcoke, family = betabinomial(link = "logit"), REML = TRUE)
+```
+
+```{r}
+## Next, the previous model with autocorrelated residuals. Note that we have to set dispformula = 0 + treated for internal reasons. However, it doesn't converge, as I mentioned would happen:
+# betabinom_rg_ar1 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~0 + treated, REML = TRUE)
+# confint(betabinom_rg_ar1, parm = "theta_")
+# confint(betabinom_rg_ar1, parm = "disp_")
+```
+
+```{r}
+# We saw the issue before was the random intercept going from 0 to infinity; what happens if we drop it?
+# betabinom_rg_ar1_noint <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime ) + SITE +  (0 + treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~1, REML = TRUE)
+# confint(betabinom_rg_ar1_noint, parm = "theta_")
+# confint(betabinom_rg_ar1_noint, parm = "disp_")
+
+## Apparently this has to do with complete separation. Essentially, with both the beta binom overdispersion parameter and R side correlation, the model gives up on estimating any residual variance.
+```
+
+```{r}
+## We can try shifting to a plain binomial, which does converge. In an omitted model, the correlations between slopes and intercepts did not converge.
+library(glmmTMB)
+binom_rg_ar1 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+confint(binom_rg_ar1, parm = "theta_")
+
+```
+
+```{r}
+binom_rg_ar1_corr <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated| PATNO) + (0 + postTreatTime||PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+confint(binom_rg_ar1_corr, parm = "theta_")
+
+```
+
+```{r}
+binom.means <- emmeans(binom_rg_ar1, specs = ~ TXNAME*treated, type = "response")
+kable(binom.means)
+```
+
+```{r}
+
+```
+
+```{r}
+binom.trends <- emtrends(binom_rg_ar1, specs = ~TXNAME, var = "treated")
+pairs(binom.trends, adjust = "none")
+```
+
+```{r}
+binom.trends2 <- emtrends(binom_rg_ar1, specs = ~1, var = "postTreatTime", at = list(treated = 1))
+binom.trends2
+```
+
+```{r}
+
+```
+
+```{r}
+## We can also fit a correlated G matrix to a plain binomial model, but it will fit extremely poorly compared to others. 
+binom_gfull <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+confint(binom_gfull, parm = "theta_")
+```
+
+```{r}
+## Now lets fit an unstructured matrix to a plain binomial, which converges
+binom_un<- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE  +  us(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+summary(binom_un)
+
+```
+
+```{r}
+#Finally, I'll fit a marginal categorical model with simple autocorrelation.
+
+binom_ar1_cat<- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * MONTH + SITE  + M0ALC30 +  ar1(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = TRUE)
+
+```
+
+```{r}
+library(emmeans)
+cat.means.bymonth <- emmeans(binom_ar1_cat, specs = ~ TXNAME*MONTH, by = "MONTH")
+
+cat.means.bymonth
+pairs(cat.means.bymonth)
+```
+
+```{r}
+## Now, we'll compare the best G only model with overdispersion, the  G model with correlated effects but no overdispersion, the best RG model with random slopes and residual autocorrelation, the best RG model with unstructured correlation and an intercept, and the best R only model with unstructured
+anova(betabinom_gfull, betabinom_g_uncorr, binom_gfull, binom_rg_ar1, binom_un)
+```
+
+```{r}
+
+best_binom_model <- binom_rg_ar1
+best_betabinom_model <- betabinom_g_uncorr
+cat_model <- binom_ar1_cat
+```
+
+```{r}
+library(performance)
+check_overdispersion(best_binom_model)
+check_overdispersion(best_betabinom_model)
+check_overdispersion(cat_model)
+```
+
+```{r}
+
+checkbrms <- check_predictions(model_brms)
+checkdf <- as.data.frame(checkbrms)
+
+simmatrix <- checkdf |>
+        select(-y) |>
+        as.matrix()
+
+simtable <- as.vector(table(simmatrix))
+
+ytable <- as.vector(table(checkdf$y))
+tablecompare <- as.data.frame(cbind(simtable, ytable))
+tablecompare$simtable <- round(tablecompare$simtable/50)
+tablecompare$daysused <- c(0:30)
+tablecompare
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+library(performance)
+checkbinom <- check_predictions(best_binom_model)
+checkbinom
+check_predictions(best_betabinom_model)
+check_predictions(cat_model)
+```
+
+```{r}
+best_binom_model <- update(object = best_binom_model, na.action = na.exclude)
+
+library(broom.mixed)
+#Get residuals as named vectors (aligned by row name)
+binom_resid <- residuals(best_binom_model, type = "deviance")
+betabinom_resid <- residuals(best_betabinom_model, type = "pearson")
+
+# Create data frames with row names
+binom_resid_df <- data.frame(
+  binom.resid = binom_resid,
+  rowid = names(binom_resid)
+)
+
+betabinom_resid_df <- data.frame(
+  betabinom.resid = betabinom_resid,
+  rowid = names(betabinom_resid)
+)
+# 
+# cat_resid_df <- data.frame(
+#   cat.resid = cat_resid,
+#   rowid = names(cat_resid)
+# )
+
+
+# Merge by row name
+combined_resids <- merge(binom_resid_df, betabinom_resid_df, by = "rowid", all = TRUE)
+
+# Add original data (also by row name)
+finalcoke$rowid <- rownames(finalcoke)
+augmented <- merge(combined_resids, finalcoke, by = "rowid", all = TRUE)
+finalcoke <- merge(combined_resids, finalcoke, by = "rowid", all = TRUE)
+```
+
+```{r}
+library(ggplot2)
+
+
+ggplot(binom_resid_df, aes(x = binom.resid)) +
+  geom_histogram(aes(y = after_stat(density)),binwidth  = 0.05) +
+  labs(title = "Binomial Model Deviance Residuals", x = "Residual", y = "Density") +
+  theme_minimal()
+
+
+ggplot(betabinom_resid_df, aes(x = betabinom.resid)) +
+  geom_histogram(aes(y = after_stat(density)),binwidth  = 0.1) 
+  labs(title = "Betabinomial Model Pearson Residuals", x = "Residual", y = "Density") +
+  theme_minimal()
+
+# ggplot(cat_resid_df, aes(x = cat.resid)) +
+#   geom_histogram(aes(y = after_stat(density)),binwidth  = 0.1) +
+#   stat_function(
+#     fun = dnorm,
+#     args = list(mean = mean(cat_resid_df$cat.resid, na.rm = TRUE),
+#                 sd = sd(cat_resid_df$cat.resid, na.rm = TRUE)),
+#     color = "darkred",
+#     linewidth = 0.5
+#   )
+```
+
+```{r}
+checkdf <- as.data.frame(checkbinom)
+
+simmatrix <- checkdf |>
+        select(-y) |>
+        as.matrix()
+
+simtable <- as.vector(table(simmatrix))
+
+ytable <- as.vector(table(checkdf$y))
+tablecompare <- as.data.frame(cbind(simtable, ytable))
+tablecompare$simtable <- round(tablecompare$simtable/50)
+tablecompare$daysused <- c(0:30)
+```
+
+```{r}
+tablecompare
+```
+
+In the aggregate, the model predicts less 0s; more 1s; less 2-5, but adequate 7s 8s. The model is completely unable to replicate the spikes at 10, 15, 20, 25, and 30, but these are likely recall error. There also seems to be a slight trend of the model overpredicting days used above 10 the gaps in the lines where green, observed is lower is higher than the gaps where it is higher. While we saw that DHARMa showed significant deviation, the difference does not appear as bad here.
+
+I would expect inclusion of fixed covariates to fix much of the lack of fit overall. I did not include these, as these would have the potential to not just be confounders but causal mediators, and absent subject matter expertise I erred on the side of caution. I did not include a zero inflation submodel as while the difference is noticeable, the model predicts about 90% of the expected zeroes, and convergence had already become an issue.
+
+```{r}
+
+```
+
+```{r}
+
+best_binom_model <- update(object = best_binom_model, na.action = na.exclude)
+
+binom.resid15 <- residuals(best_binom_model, type = "deviance")
+
+binom_pred <- predict(best_binom_model, newdata = finalcoke,
+                       type = "response")
+
+finalcoke$binom_pred <- as.vector(binom_pred)* 30
+
+outliers <- finalcoke |>
+    filter(binom.resid15 < -1.8 | binom.resid15 > 1.8) |>
+    select(DAYSUSED, binom.resid, TXNAME, MONTH, PATNO, BDI, binom_pred)
+summary(finalcoke$binom_resid)
+
+
+
+ggplot(data = outliers, aes(x = logit_days, y = binom_pred, color = TXNAME)) + geom_point() + geom_jitter()
+
+ggplot(data = finalcoke, aes(x = binom_pred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_jitter() + geom_smooth()
+```
+
+```{r}
+View(outliers)
+```
+
+```{r}
+finalcoke$rawresid <- finalcoke$binom_pred - finalcoke$DAYSUSED
+summary(finalcoke$rawresid)
+```
+
+```{r}
+outliers2 <- finalcoke |>
+    filter(rawresid < -2 | rawresid > 2) |>
+    select(DAYSUSED, rawresid, TXNAME, MONTH, PATNO, BDI, binom_pred)
+View(outliers2)
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = binom_pred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_jitter() + geom_smooth() 
+
+
+ggplot(data = finalcoke, aes(x = binom_pred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_jitter() + geom_smooth() +  scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 0.1)) + scale_x_continuous(trans = scales::pseudo_log_trans(sigma = 0.1)) 
+```
+
+```{r}
+best_betabinom_model <- update(object = betabinom_g_uncorr, na.action = na.exclude)
+betabinom_pred <- predict(best_betabinom_model, newdata = finalcoke,
+                       type = "response")
+finalcoke$betabinom_pred <- as.vector(betabinom_pred)* 30
+
+summary(finalcoke$betabinom.resid)
+quantile(finalcoke$betabinom.resid, na.rm = TRUE, probs = c(1,2,10,50,90,98,99)/100)
+outliers <- finalcoke |>
+    filter(betabinom.resid < -2 | betabinom.resid > 2)
+
+outliers <- finalcoke |>
+    filter(betabinom.resid < -2 | betabinom.resid > 2)
+
+outliers$outliertype<- ifelse(outliers$betabinom.resid > 2,  yes = "high", no = "low")
+
+ggplot(data = outliers, aes(x = logit_days, y = betabinom_pred, color = TXNAME)) + geom_point() + geom_jitter() + facet_wrap(~ outliertype)
+
+
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = betabinom_pred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_jitter() + geom_smooth() +  scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 1)) + scale_x_continuous(trans = scales::pseudo_log_trans(sigma = 1)) 
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = month_num, y = binom_pred, color = TXNAME)) +
+geom_smooth()
+```
+
+```{r}
+cat_model <- update(object = cat_model, na.action = na.exclude)
+cat_pred <- predict(cat_model, newdata = finalcoke,
+                       type = "response")
+finalcoke$cat_pred <- as.vector(cat_pred)* 30
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = cat_pred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_jitter() + geom_smooth()
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = month_num, y = cat_pred, color = TXNAME)) +
+geom_smooth()
+```
+
+```{r}
+
+model.no.tx <- binom_rg_ar1 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME+  (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(0 + MONTH| PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+
+model.with.tx <- update(best_binom_model, REML = FALSE) 
+anova(model.no.tx, model.with.tx)
+```
+
+```{r}
+library(car)
+Anova(best_binom_model)
+Anova(best_betabinom_model)
+Anova(cat_model)
+```
+
+```{r}
+library(emmeans)
+binomtrends1 <- emtrends(best_binom_model, ~TXNAME, var ="treated")
+binomtrends1
+pairs(binomtrends1)
+```
+
+```{r}
+binomtrends2 <- emtrends(best_binom_model, ~TXNAME, var ="postTreatTime")
+binomtrends2
+pairs(binomtrends2)
+```
+
+```{r}
+lsmeans.cat <- emmeans(cat_model, specs = ~ TXNAME*MONTH)
+lsmeans.time <- emmeans(cat_model, specs = ~ MONTH)
+```
+
+```{r}
+pairs(lsmeans.cat, by = "MONTH", adjust = 'tukey')
+```
+
+```{r}
+lsmeans.time
+pairs(lsmeans.time)
+```
+
+```{r}
+finalcoke <- finalcoke |>
+    group_by(PATNO) |>
+    mutate(nmeasures = n()) |>
+    ungroup() 
+finalcoke$nmeasures <- as.factor(finalcoke$nmeasures)
+```
+
+```{r}
+intake <- finalcoke |>
+    filter(MONTH == 0)
+```
+
+```{r}
+table(finalcoke$MONTH)
+```
+
+```{r}
+table(intake$nmeasures)
+```
+
+```{r}
+intaketest1 <- lm(M0ALU30 ~ nmeasures, data = intake)
+summary(intaketest1)
+```
+
+There is no evidence that the propensity to return was influence by baseline
+
+```{r}
+randomtest <- lm(M0ALU30 ~ TXNAME, data = intake)
+summary(randomtest)
+```
+
+```{r}
+best_binom_model <- binom_rg_ar1
+mixturecheckneg1 <- update(best_binom_model, REML = FALSE)
+```
+
+```{r}
+mixturecheck <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (0 + TXNAME*(treated + postTreatTime)|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), REML = FALSE)
+
+```
+
+```{r}
+confint(mixturecheck, parm = "theta_")
+```
+
+```{r}
+mixturecheck2 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated + postTreatTime) + SITE +  (0 + TXNAME*(treated + postTreatTime)|| PATNO) + ar1(MONTH + 0 |PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+```
+
+```{r}
+kable(confint(mixturecheck2, parm = "theta_"))
+```
+
+```{r}
+
+mixturecheck3 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ as.numeric(nmeasures)*TXNAME * (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(MONTH + 0 |PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+```
+
+```{r}
+Anova(mixturecheck3)
+```
+
+```{r}
+mixturecheck4 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME + nmeasures* (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(MONTH + 0 |PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+```
+
+```{r}
+Anova(mixturecheck4)
+```
+
+```{r}
+mixturecheck5 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME + nmeasures* (treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(MONTH + 0 |PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+```
+
+```{r}
+mixturecheck6 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~  as.numeric(nmeasures) +  TXNAME*(treated + postTreatTime) + SITE +  (treated + postTreatTime|| PATNO) + ar1(MONTH + 0 |PATNO), data = finalcoke, family = binomial(link = "logit"), REML = FALSE)
+```
+
+```{r}
+Anova(mixturecheck5)
+```
+
+```{r}
+kable(anova(mixturecheckneg1, mixturecheck, mixturecheck2, mixturecheck3, mixturecheck4, mixturecheck5, mixturecheck6))
+```
+
+```{r}
+# library(readr)
+# write_excel_csv(augmented2, '/Users/danielcohen/Desktop/R_Code/finalcokeresids')
+# write_excel_csv(ranefs_df, '/Users/danielcohen/Desktop/R_Code/finalcokerandomeffects')
+```
+
+```{r}
+library(glmmTMB)
+
+ordbeta <- glmmTMB(DAYSUSED/31 ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = ordbeta(link = "logit"), dispformula = ~ treated)
+
+```
+
+```{r}
+zibeta <- glmmTMB(DAYSUSED/31 ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = beta_family(), ziformula =~ ., dispformula = ~ treated)
+```
+
+```{r}
+anova(ordbeta, zibeta)
+```
+
+```{r}
+Anova(zibeta)
+Anova(zibeta, component = "zi")
+Anova(zibeta, component = "disp")
+```
+
+```{r}
+zib_pred <- predict(zibeta, newdata = finalcoke,
+                       t = "response")
+finalcoke$zib_pred <- as.vector(zib_pred) * 31
+```
+
+```{r}
+zib_trends <- emtrends(zibeta, specs =  ~TXNAME, component = "response", var = "treated")
+zib_trends
+pairs(zib_trends)
+```
+
+```{r}
+zib_trends2 <- emtrends(zibeta, specs =  ~TXNAME, component = "response", var = "postTreatTime")
+zib_trends2
+pairs(zib_trends2)
+```
+
+```{r}
+ggplot(data = finalcoke, aes(y = zib_pred, x = DAYSUSED)) +
+    geom_point() + 
+geom_smooth()
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = month_num, y = zib_pred, color = TXNAME)) +
+geom_smooth()
+```
+
+```{r}
+ordbeta <- glmmTMB(DAYSUSED/31 ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime|| PATNO), data = finalcoke, family = ordbeta(link = "logit"), dispformula = ~ treated, REML = TRUE) 
+
+```
+
+```{r}
+library(car)
+Anova(ordbeta)
+```
+
+```{r}
+ordb_pred <- predict(ordbeta, newdata = finalcoke,
+                       type = "response")
+finalcoke$ordpred<- as.vector(ordb_pred) * 31
+```
+
+```{r}
+ggplot(data = finalcoke, aes(y = ordpred, x = DAYSUSED)) +
+    geom_point() + 
+geom_smooth()
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = month_num, y = ordb_pred, color = TXNAME)) +
+geom_smooth()
+```
+
+```{r}
+ordtrends1 <- emtrends(ordbeta, ~TXNAME, var ="treated", component = "response")
+ordtrends1
+pairs(ordtrends1)
+```
+
+```{r}
+ordmeans <- emmeans(ordbeta, ~ TXNAME*treated, component = "response")
+ordmeans
+pairs(ordmeans, by = "treated")
+```
+
+```{r}
+ordmeans2 <- emmeans(ordbeta, ~ TXNAME*postTreatTime, type = "response", at = c(postTreatTime = list(c(0,1,2,3,4,5))))
+ordmeans2
+pairs(ordmeans2, by = "postTreatTime")
+```
+
+```{r}
+library(glmmTMB)
+nbdays <- glmmTMB(DAYSUSED ~ TXNAME * (treated + postTreatTime ) + SITE +  (treated + postTreatTime| PATNO), data = finalcoke, family = nbinom1(link = "log"), REML = TRUE, na.action = na.exclude)
+confint(nbdays, parm = "theta_")
+confint(nbdays, parm = "disp_")
+```
+
+```{r}
+finalcoke$nbpred <- round(exp(predict(nbdays)))
+```
+
+```{r}
+ggplot(data = finalcoke, aes(x = nbpred, y = DAYSUSED, color = TXNAME)) + geom_point() + geom_smooth() + geom_jitter()
+```
+
+```{r}
+
+nbtrends <- emtrends(nbdays, specs = ~ TXNAME, var = "treated") 
+nbtrends
+pairs(nbtrends, adjust = "tukey")
+```
+
+```{r}
+
+```
+
+```{r}
+library(marginaleffects)
+avg_predictions(model = betabinom_g_uncorr,
+                variables = "treated",
+                type = "link")
+```
+
+```{r}
+check_predictions(best_binom_model)
+```
+
+```{r}
+check_predictions()
+```
+
+```{r}
+finalcoke$treated2<- ifelse(test = finalcoke$MONTH %in% c(0,1,2), yes = finalcoke$MONTH, no = 2)
+
+finalcoke$postTreatTime2 <- ifelse(test = finalcoke$MONTH %in% c(0,1,2), yes = 0, no = as.numeric(finalcoke$MONTH) -1 ) 
+```
+
+```{r}
+betabinom_g_uncorr2 <- glmmTMB(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * (treated2 + postTreatTime2 ) + SITE +  (treated2 + postTreatTime2|| PATNO), data = finalcoke, family = betabinomial(link = "logit"), dispformula = ~treated, REML = TRUE)
+confint(betabinom_g_uncorr2, parm = "theta_")
+confint(betabinom_g_uncorr2, parm = "disp_")
+```
+
+```{r}
+betabinom_g_uncorr2.ml <- update(betabinom_g_uncorr2, REML = FALSE)
+betabinom_g_uncorr.ml <- update(betabinom_g_uncorr, REML = FALSE)
+anova(betabinom_g_uncorr2.ml, betabinom_g_uncorr.ml)
+```
+
+```{r}
+Anova(cat_model)
+```
+
+```{r}
+cat.means <- emmeans(cat_model, specs = ~ TXNAME*MONTH, by = "TXNAME", type = "response")
+cat.means
+```
+
+```{r}
+pairs(cat.means, adjust = "tukey")
+```
+
+```{r}
+finalcoke$month.num <- as.numeric(finalcoke$MONTH)
+days.cat.gee <- glmgee(cbind(DAYSUSED, 30 - DAYSUSED) ~ TXNAME * MONTH  + SITE, data = finalcoke, corst = "Unstructured", id = PATNO, waves = month.num, family = quasibinomial(link = "logit"), na.action = na.omit)
+anova(days.cat.gee)
+```
+
+```{r}
+#cat.gee.means <- emmeans(days.cat.gee, specs = ~ TXNAME*MONTH, by = "TXNAME", type = "response")
+
+summary(cat.gee.means, bias.adjust = TRUE, sigma = total.SD)
+```
+
+```{r}
+pairs(cat.gee.means, adjust = "none")
+```
+
+```{r}
+glmtoolbox::QIC(days.cat.gee, days_gee1)
+```
+
+```{r}
+best_binom_model_ml <- update(best_binom_model, REML = FALSE)
+best_betabinom_model_ml <- update(best_betabinom_model, REML = FALSE)
+cat_model_ml <- update(cat_model, REML = FALSE)
+BIC(cat_model_ml, best_betabinom_model_ml, best_binom_model_ml)
+```
+
+```{r}
+anova(cat_model_ml, best_betabinom_model_ml, best_binom_model_ml)
+```
+
+```{r}
+library(report)
+cite_packages()
+```
+
+```{r}
+
+```
+
+```{r}
+library(glmmTMB)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Extract random effects (conditional modes)
+ranef_vals <- ranef(best_binom_model)$cond$PATNO
+
+# Check column names (adjust if different)
+colnames(ranef_vals)
+# Typical output: "(Intercept)", "treated", "postTreatTime"
+```
+
+```{r}
+# Convert to data frame for plotting
+ranef_df <- as.data.frame(ranef_vals) 
+
+# Reshape to long format
+ranef_long <- ranef_df %>%
+  pivot_longer(everything(), 
+               names_to = "parameter", 
+               values_to = "value")
+
+# Function to add normal curve to a histogram
+add_normal_curve <- function(p, data, param_name) {
+  param_data <- data %>% filter(parameter == param_name)
+  mu <- mean(param_data$value, na.rm = TRUE)
+  sigma <- sd(param_data$value, na.rm = TRUE)
+  
+  p + stat_function(
+    fun = dnorm,
+    args = list(mean = mu, sd = sigma),
+    color = "darkred",
+    linewidth = 1,
+    linetype = "dashed"
+  )
+}
+
+# Create individual plots
+p1 <- ggplot(filter(ranef_long, parameter == "(Intercept)"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Intercepts", x = "Intercept", y = "Density") +
+  theme_minimal()
+
+p2 <- ggplot(filter(ranef_long, parameter == "treated"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Slopes (treated)", x = "treated", y = "Density") +
+  theme_minimal()
+
+p3 <- ggplot(filter(ranef_long, parameter == "postTreatTime"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Slopes (postTreatTime)", x = "postTreatTime", y = "Density") +
+  theme_minimal()
+
+# Add normal curves
+p1 <- add_normal_curve(p1, ranef_long, "(Intercept)")
+p2 <- add_normal_curve(p2, ranef_long, "treated")
+p3 <- add_normal_curve(p3, ranef_long, "postTreatTime")
+
+# Display plots
+print(p1)
+print(p2)
+print(p3)
+```
+
+```{r}
+p1 <- ggplot(filter(ranef_long, parameter == "Month0"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Intercepts", x = "Intercept", y = "Density") +
+  theme_minimal()
+p1
+```
+
+```{r}
+shapiro.test(ranef_df$`(Intercept)`)
+shapiro.test(ranef_df$treated)
+shapiro.test(ranef_df$postTreatTime)
+```
+
+```{r}
+library(moments)
+skewness(ranef_df$`(Intercept)`)
+skewness(ranef_df$treated)
+skewness(ranef_df$postTreatTime)
+```
+
+```{r}
+library(moments)
+library(dplyr)
+
+library(moments)
+library(dplyr)
+
+# Extract random effects
+ranef_vals <- ranef(best_binom_model)$cond$PATNO
+
+# Calculate statistics
+norm_table <- ranef_vals %>%
+  reframe(
+    Parameter = c("(Intercept)", "treated", "postTreatTime"),
+    N = c(n(), n(), n()),
+    SD = c(sd(`(Intercept)`, na.rm = TRUE),
+           sd(treated, na.rm = TRUE),
+           sd(postTreatTime, na.rm = TRUE)),
+    Skew = c(skewness(`(Intercept)`, na.rm = TRUE),
+             skewness(treated, na.rm = TRUE),
+             skewness(postTreatTime, na.rm = TRUE)),
+    Kurtosis = c(kurtosis(`(Intercept)`, na.rm = TRUE) - 3,
+                 kurtosis(treated, na.rm = TRUE) - 3,
+                 kurtosis(postTreatTime, na.rm = TRUE) - 3),
+    Shapiro_W = c(shapiro.test(`(Intercept)`)$statistic,
+                  shapiro.test(treated)$statistic,
+                  shapiro.test(postTreatTime)$statistic)
+  )
+
+print(norm_table)
+```
+
+```{r}
+library(flextable)
+flextable(norm_table)
+```
+
+```{r}
+library(glmmTMB)
+int <- glmmTMB(`(Intercept)` ~ 1, data = ranef_df, family = t_family)
+family_params(int)
+tr <- glmmTMB(treated ~ 1, data = ranef_df, family = t_family)
+family_params(tr)
+po <- glmmTMB(postTreatTime ~ 1, data = ranef_df, family = t_family)
+family_params(po)
+```
+
+```{r}
+p1 <- ggplot(filter(ranef_long, parameter == "MONTH)"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Intercepts", x = "Intercept", y = "Density") +
+  theme_minimal()
+
+p2 <- ggplot(filter(ranef_long, parameter == "treated"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Slopes (treated)", x = "treated", y = "Density") +
+  theme_minimal()
+
+p3 <- ggplot(filter(ranef_long, parameter == "postTreatTime"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Slopes (postTreatTime)", x = "postTreatTime", y = "Density") +
+  theme_minimal()
+```
+
+```{r}
+p1 <- ggplot(filter(ranef_long, parameter == "MONTH0"), aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "steelblue", alpha = 0.6) +
+  labs(title = "Random Intercepts", x = "Intercept", y = "Density") +
+  theme_minimal()
+p1
+```
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Extract the month‑specific random effects
+
+
+# Convert to long format for ggplot
+ranef_long <- ranef_df %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("PATNO") %>%
+  tidyr::pivot_longer(cols = tidyselect::starts_with("MONTH"), names_to = "Month", values_to = "RE")
+
+# Boxplots
+ggplot(ranef_long, aes(x = Month, y = RE)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Subject‑Specific Time Random Effects",
+       y = "Conditional Mode", x = "Month") +
+  theme_minimal()
+```
+
+```{r}
+library(corrplot)
+
+cor_matrix <- cor(ranef_df, use = "pairwise.complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper",
+         title = "Correlation of Month‑Specific Random Effects")
+```
+
+```{r}
+set.seed(123)
+subset_rows <- sample(1:nrow(ranef_df), 50)
+
+heatmap(t(ranef_df[subset_rows, ]), 
+        Rowv = NA, Colv = NA, 
+        scale = "none",
+        main = "Random Effects by Month (50 subjects)",
+        xlab = "Subject", ylab = "Month")
+```
+
+```{r}
+
+```
